@@ -12,9 +12,10 @@ The jupyter notebook is currently work in progress. We have done exploratory wor
 
 ### Exploratory research
 Following are some charts on Bank Nifty index futures.
+
 ACF and PACF for volumes and open interest show high auto-correlation at lag 1 (minute) but it fades away fast.
 ![image](https://github.com/user-attachments/assets/0f7a80ad-d9c7-4a5b-83cd-d9184b7678b9)
-![image](https://github.com/user-attachments/assets/3e948d59-faa7-4b5a-b3ba-dfae2b81ec87)
+
 Returns however don't look significantly serially correlated at all. Closing price is only significant at lag 1, suggesting that it follows a Markov process.
 ![image](https://github.com/user-attachments/assets/d3c1223d-c782-489e-8c83-3e1694e5db05)
 
@@ -24,6 +25,8 @@ Overall correlations are not significant among return, volumes and open interest
 Bollinger band evolution
 ![image](https://github.com/user-attachments/assets/2e8935ea-2ec4-4d7a-8627-66197e385b03)
 
+Robustness testing with respect to window size, band size and by lags.
+![image](https://github.com/user-attachments/assets/3e948d59-faa7-4b5a-b3ba-dfae2b81ec87)
 
 --------------------------------------------------------------------------------------------------------------------------------
 TREASURY BOND FUTURES WORK (ARCHIVED) - based on yahoo finance hourly data
