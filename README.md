@@ -26,7 +26,7 @@ Bollinger band evolution
 
 ![image](https://github.com/user-attachments/assets/2e8935ea-2ec4-4d7a-8627-66197e385b03)
 
-Robustness testing with respect to window size, band size and by lags.
+Robustness testing with respect to window size, band size and by lags. We do seem to have fair results but not too exciting. We will continue to test the other features and keep on sharing the results here.
 ![image](https://github.com/user-attachments/assets/3e948d59-faa7-4b5a-b3ba-dfae2b81ec87)
 
 --------------------------------------------------------------------------------------------------------------------------------
