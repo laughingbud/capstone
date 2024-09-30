@@ -23,6 +23,7 @@ Overall correlations are not significant among return, volumes and open interest
 ![image](https://github.com/user-attachments/assets/19a20b24-1c51-44e6-a627-591c9df036d9)
 
 Bollinger band evolution
+
 ![image](https://github.com/user-attachments/assets/2e8935ea-2ec4-4d7a-8627-66197e385b03)
 
 Robustness testing with respect to window size, band size and by lags.
