@@ -20,13 +20,14 @@ We build Bollinger bands with window = 20, band = 2. We show price evolution vis
 We implement robustness testing on the mean reversion Bollinger band strategy with varying lookback window, bands and lags. Beyond band 2, the strategy detracts as it probably signals breakout and there is strong trend. 
 ![image](https://github.com/user-attachments/assets/b5350c5a-6908-4180-aa92-dbd5625304bc)
 
-Next, we incorporate the breakout or trend, in the signal by going long when closing price is above band 3 and short when it's below -3. 
+Next, we incorporate the breakout or trend, in the signal by going long when closing price is above band 4 and short when it's below -4. 
 ![image](https://github.com/user-attachments/assets/b9cb322a-119a-4c06-ad76-d5fa7af923eb)
 
 We plot the bar charts of sharpe ratio for the same set of parameters run on Mean reversion and Mean reversion+trend strategy.
 
 - There is strong alpha decay as we increase the lags, lookback window and the band size.
-- Mean reversion + trend, does worse in most cases suggesting a need to build a smarter signal 
-![image](https://github.com/user-attachments/assets/2606fa45-cc39-4101-a8ac-b62cbb391771)
+- Trend does not add value in most cases suggesting a need to build a smarter signal. However there is one particular case where trend + mean reversion does exceedingly well, look back window is 15, bollinger band for mean reversion is 2, threshold for trend is beyond band 4 and with lag of 1, the sharpe ratio achieved is above 0.51.
+![image](https://github.com/user-attachments/assets/c9db1d68-e4cb-4b0c-8172-e81d08615dc5)
+
 
 --------------------------------------------------------------------------------------------------------------------------------
