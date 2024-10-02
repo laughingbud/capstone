@@ -10,24 +10,20 @@ We aim to explore multi-market and trading sessions for intra-day trading opport
 ### **Usage**:
 The jupyter notebook is currently work in progress. We have done exploratory work which should be visible and bit self explanatory.
 
-### Exploratory research
-Following are some charts on Bank Nifty index futures.
+### Exploratory researchWe build Bollinger bands with window = 20, band = 2. We show price evolution vis a vis bands and the mean reversion strategy evolution with discrete and continuous signal. This is at lag 0 as we shift the signal by 1 for immediate implementation.
+![image](https://github.com/user-attachments/assets/0274a3c6-40c3-4b05-92e5-f33ab9bdca71)
 
-ACF and PACF for volumes and open interest show high auto-correlation at lag 1 (minute) but it fades away fast.
-![image](https://github.com/user-attachments/assets/0f7a80ad-d9c7-4a5b-83cd-d9184b7678b9)
+We implement robustness testing on the mean reversion Bollinger band strategy with varying lookback window, bands and lags. Beyond band 2, the strategy detracts as it probably signals breakout and there is strong trend. 
+![image](https://github.com/user-attachments/assets/b5350c5a-6908-4180-aa92-dbd5625304bc)
 
-Returns however don't look significantly serially correlated at all. Closing price is only significant at lag 1, suggesting that it follows a Markov process.
-![image](https://github.com/user-attachments/assets/d3c1223d-c782-489e-8c83-3e1694e5db05)
+Next, we incorporate the breakout or trend, in the signal by going long when closing price is above band 3 and short when it's below -3. 
+![image](https://github.com/user-attachments/assets/b9cb322a-119a-4c06-ad76-d5fa7af923eb)
 
-Overall correlations are not significant among return, volumes and open interest
-![image](https://github.com/user-attachments/assets/19a20b24-1c51-44e6-a627-591c9df036d9)
+We plot the bar charts of sharpe ratio for the same set of parameters run on Mean reversion and Mean reversion+trend strategy.
 
-Bollinger band evolution
-
-![image](https://github.com/user-attachments/assets/2e8935ea-2ec4-4d7a-8627-66197e385b03)
-
-Robustness testing with respect to window size, band size and by lags. We do seem to have fair results but not too exciting. We will continue to test the other features and keep on sharing the results here.
-![image](https://github.com/user-attachments/assets/3e948d59-faa7-4b5a-b3ba-dfae2b81ec87)
+- There is strong alpha decay as we increase the lags, lookback window and the band size.
+- Mean reversion + trend, does worse in most cases suggesting a need to build a smarter signal 
+![image](https://github.com/user-attachments/assets/2606fa45-cc39-4101-a8ac-b62cbb391771)
 
 --------------------------------------------------------------------------------------------------------------------------------
 TREASURY BOND FUTURES WORK (ARCHIVED) - based on yahoo finance hourly data
