@@ -26,8 +26,9 @@ Next, we incorporate the breakout or trend, in the signal by going long when clo
 We plot the bar charts of sharpe ratio for the same set of parameters run on Mean reversion and Mean reversion+trend strategy.
 
 - There is strong alpha decay as we increase the lags, lookback window and the band size.
-- Trend does not add value in most cases suggesting a need to build a smarter signal. However there is one particular case where trend + mean reversion does exceedingly well, look back window is 15, bollinger band for mean reversion is 2, threshold for trend is beyond band 4 and with lag of 1, the sharpe ratio achieved is above 0.51.
-![image](https://github.com/user-attachments/assets/c9db1d68-e4cb-4b0c-8172-e81d08615dc5)
+- Trend does not add value in most cases suggesting a need to build a smarter signal.
+![image](https://github.com/user-attachments/assets/f2cba23e-0801-4327-973e-93ed1bb76de1)
+
 
 
 --------------------------------------------------------------------------------------------------------------------------------
