@@ -11,6 +11,9 @@ We aim to explore multi-market and trading sessions for intra-day trading opport
 The jupyter notebook is currently work in progress. We have done exploratory work which should be visible and bit self explanatory.
 
 ### Exploratory research
+You can go through the full research here: https://github.com/laughingbud/capstone/blob/main/Exploratory_research.md
+
+### Preliminary Results
 We build Bollinger bands with window = 20, band = 2. We show price evolution vis a vis bands and the mean reversion strategy evolution with discrete and continuous signal. This is at lag 0 as we shift the signal by 1 for immediate implementation.
 ![image](https://github.com/user-attachments/assets/0274a3c6-40c3-4b05-92e5-f33ab9bdca71)
 
