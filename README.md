@@ -24,11 +24,12 @@ We implement robustness testing on the mean reversion Bollinger band strategy wi
 Next, we incorporate the breakout or trend, in the signal by going long when closing price is above band 3 and short when it's below -3. 
 ![image](https://github.com/user-attachments/assets/05d50001-5b14-4110-8c34-0e889ac122ed)
 
-We plot the bar charts of sharpe ratio for the same set of parameters run on Mean reversion and Mean reversion+trend strategy.
+We plot the bar charts of sharpe ratio for the same set of parameters run on Mean reversion and Mean reversion+trend strategy. Assuming risk free rate as 2%. The average cash rate was around 1.25% over 2022 to 2023 period per Ken French Dartmouth library data. https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html#Research
 
 - There is strong alpha decay as we increase the lags, lookback window and the band size.
 - Trend does not add value in most cases suggesting a need to build a smarter signal.
-- ![image](https://github.com/user-attachments/assets/e81ea227-688e-4f10-8f29-28d34112e306)
+![image](https://github.com/user-attachments/assets/9ec09747-e649-4873-bdec-baf6a0e32189)
+
 
 **Seasonality**
 We showed in our exploratory research how Bank Nifty returns follow a seasonality pattern of 15 min. We thought to test it for different window sizes.
