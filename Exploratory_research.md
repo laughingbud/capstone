@@ -51,6 +51,9 @@ We plot the bar charts of sharpe ratio for the same set of parameters run on Mea
 - Mean reversion + trend, does worse in most cases suggesting a need to build a smarter signal
 ![image](https://github.com/user-attachments/assets/2bc023f7-2bdd-4a8a-9928-7473dc31fb7b)
 
+Zooming into shorter windows, alpha decay does seem consistent with increasing lookback window. Trend does not seem to add any value here.
+![image](https://github.com/user-attachments/assets/1c5e5f56-f914-499e-bb45-29286b1c98de)
+
 ------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------
