@@ -14,6 +14,7 @@ The jupyter notebook is currently work in progress. We have done exploratory wor
 You can go through the full research here: https://github.com/laughingbud/capstone/blob/main/Exploratory_research.md
 
 ### Preliminary Results
+**Mean reversion**
 We build Bollinger bands with window = 20, band = 2. We show price evolution vis a vis bands and the mean reversion strategy evolution with discrete and continuous signal. This is at lag 0 as we shift the signal by 1 for immediate implementation.
 ![image](https://github.com/user-attachments/assets/0274a3c6-40c3-4b05-92e5-f33ab9bdca71)
 
@@ -29,6 +30,11 @@ We plot the bar charts of sharpe ratio for the same set of parameters run on Mea
 - Trend does not add value in most cases suggesting a need to build a smarter signal.
 - ![image](https://github.com/user-attachments/assets/e81ea227-688e-4f10-8f29-28d34112e306)
 
+**Seasonality**
+We showed in our exploratory research how Bank Nifty returns follow a seasonality pattern of 15 min. We thought to test it for different window sizes.
+- Seasonality does look quite significant as our simple betting strategy goes long if there was positive return 15 mins ago and short if it was negative
+- We could further enhance the strategy by making the criteria smarter.
+![image](https://github.com/user-attachments/assets/eb64822e-98a0-42c4-b8cb-174c7c50cc4a)
 
 
 --------------------------------------------------------------------------------------------------------------------------------
