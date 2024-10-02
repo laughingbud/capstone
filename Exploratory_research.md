@@ -54,6 +54,12 @@ We plot the bar charts of sharpe ratio for the same set of parameters run on Mea
 Zooming into shorter windows, alpha decay does seem consistent with increasing lookback window. Trend does not seem to add any value here.
 ![image](https://github.com/user-attachments/assets/1c5e5f56-f914-499e-bb45-29286b1c98de)
 
+**Seasonality**
+We showed in our exploratory research how Bank Nifty returns follow a seasonality pattern of 15 min. We thought to test it for different window sizes.
+- Seasonality does look quite significant as our simple betting strategy goes long if there was positive return 15 mins ago and short if it was negative
+- We could further enhance the strategy by making the criteria smarter.
+![image](https://github.com/user-attachments/assets/eb64822e-98a0-42c4-b8cb-174c7c50cc4a)
+
 ------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------
