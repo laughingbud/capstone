@@ -55,7 +55,9 @@ Zooming into shorter windows, alpha decay does seem consistent with increasing l
 ![image](https://github.com/user-attachments/assets/1c5e5f56-f914-499e-bb45-29286b1c98de)
 
 **Seasonality**
-We showed in our exploratory research how Bank Nifty returns follow a seasonality pattern of 15 min. We thought to test it for different window sizes.
+We showed in our exploratory research how Bank Nifty returns follow a seasonality pattern of 15 min. We thought to test it for different window sizes. At 5% significance:
+![image](https://github.com/user-attachments/assets/831000ae-403e-4c57-9596-1f35a322a10d)
+
 - Seasonality does look quite significant as our simple betting strategy goes long if there was positive return 15 mins ago and short if it was negative
 - We could further enhance the strategy by making the criteria smarter. Currently we are simply betting in direction or against by measuring sign of significant autocorrelation and checking whether the prior period (say 2 min back) return was simply positive and negative.
 ![image](https://github.com/user-attachments/assets/4887af59-7bfa-4dc3-8468-161b8c4c3ae7)
