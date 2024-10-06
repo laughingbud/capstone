@@ -131,29 +131,7 @@ class TickerData:
         df = self.filter_large_csv(zip_ref.namelist()[0],
                                    filter_value=filter_name,filter_column=None,
                                    chunksize=10000,date_filter=date_filter)
-
         return df
-
-#    def store_git(self,file_name):
-#        !git config --global user.email "ditesh.verma@gmail.com"
-#        !git config --global user.name "laughingbud"
-#        # !got config --global user.password "wrongpassword"
-#
-#        username = 'laughingbud'
-#        repo = 'conquer'
-#        !git clone https://{token}@github.com/{username}/{repo}
-#
-#        all_data.to_csv(f'conquer/all_ticker_intraday_data_{all_data.index.get_level_values(1).unique()[0].strftime("%Y-%m-%d")}.csv')
-#        !git status
-#        !git add --all
-#        !git commit -a -m "adding intraday data"
-#        !git status
-#        !git remote -v
-#        !git commit -a -m "adding intraday data"
-#        !git push origin main
-#
-#        # self.config.to_csv(file_name)
-#        return None
 
     def download_data(self, tickers, start_date, interval='1h',
                       default_max_period=False):
@@ -399,3 +377,24 @@ def convert_to_datetime(row):
         except ValueError:
           print(f"Could not convert date and time for row: {row}")
           return pd.NaT
+
+#    def store_git(self,file_name):
+#        !git config --global user.email "ditesh.verma@gmail.com"
+#        !git config --global user.name "laughingbud"
+#        # !got config --global user.password "wrongpassword"
+#
+#        username = 'laughingbud'
+#        repo = 'conquer'
+#        !git clone https://{token}@github.com/{username}/{repo}
+#
+#        all_data.to_csv(f'conquer/all_ticker_intraday_data_{all_data.index.get_level_values(1).unique()[0].strftime("%Y-%m-%d")}.csv')
+#        !git status
+#        !git add --all
+#        !git commit -a -m "adding intraday data"
+#        !git status
+#        !git remote -v
+#        !git commit -a -m "adding intraday data"
+#        !git push origin main
+#
+#        # self.config.to_csv(file_name)
+#        return None
