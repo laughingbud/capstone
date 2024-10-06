@@ -133,7 +133,7 @@ class TickerData:
                                    chunksize=10000,date_filter=date_filter)
 
         return df
-
+"""
     def store_git(self,file_name):
         !git config --global user.email "ditesh.verma@gmail.com"
         !git config --global user.name "laughingbud"
@@ -154,7 +154,7 @@ class TickerData:
 
         # self.config.to_csv(file_name)
         return None
-
+"""
     def download_data(self, tickers, start_date, interval='1h',
                       default_max_period=False):
         today = datetime.today()
