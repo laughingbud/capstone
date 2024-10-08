@@ -1,3 +1,5 @@
+import matplotlib.pyplot as plt
+
 class Exploratory():
     def __init__(self):
         pass
