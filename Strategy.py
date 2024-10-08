@@ -267,7 +267,7 @@ class Strategy:
         most_frequent_time_diff = returns.index.to_series().diff().mode()[0]
 
         if most_frequent_time_diff == pd.Timedelta(minutes=1) or most_frequent_time_diff == pd.Timedelta(hours=1):
-          time_difference = bank_nifty_f1[bank_nifty_f1.index.date == bank_nifty_f1.index.date[0]].index.max() - bank_nifty_f1[bank_nifty_f1.index.date == bank_nifty_f1.index.date[0]].index.min()
+          time_difference = returns[returns.index.date == returns.index.date[0]].index.max() - returns[returns.index.date == returns.index.date[0]].index.min()
           trading_hours = time_difference.total_seconds() / 3600
 
         if most_frequent_time_diff == pd.Timedelta(minutes=1):
