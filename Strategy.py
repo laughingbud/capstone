@@ -286,12 +286,12 @@ class Strategy:
         analytics['Sortino Ratio'] = (returns.mean()*np.sqrt(multiplier) / returns[returns < 0].std()).round(1)
         analytics['Max Drawdown'] = (returns.cummax() - returns.cumsum()).max()
         analytics['VaR(95%)'] = returns.quantile(0.05)
-        analytics['Exp_shortfall(95%)'] = returns[returns <= returns.quantile(0.05)].mean()
+        analytics['Exp shortfall(95%)'] = returns[returns <= returns.quantile(0.05)].mean()
         # analytics['Annualized Return'] = (1 + returns).prod() ** (252*24 / len(returns)) - 1
         # analytics['Annualized Volatility'] = returns.std() * ((252*24) ** 0.5)
         # analytics['Total return'] = ((1 + returns).cumprod() - 1)[-1]
-        analytics['Ann._return'] = (returns.mean()*multiplier).round(3)
-        analytics['Ann._vol'] = (returns.std()*np.sqrt(multiplier)).round(3)
+        analytics['Ann. return'] = (returns.mean()*multiplier).round(3)
+        analytics['Ann. vol'] = (returns.std()*np.sqrt(multiplier)).round(3)
         
         return analytics
 
