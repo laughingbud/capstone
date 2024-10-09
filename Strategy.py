@@ -269,7 +269,7 @@ class Strategy:
         if most_frequent_time_diff == pd.Timedelta(minutes=1) or most_frequent_time_diff == pd.Timedelta(hours=1):
           time_difference = returns[returns.index.date == returns.index.date[0]].index.max() - returns[returns.index.date == returns.index.date[0]].index.min()
           trading_hours = time_difference.total_seconds() / 3600
-
+          print(f'Trading hours:{trading_hours}')
         if most_frequent_time_diff == pd.Timedelta(minutes=1):
           multiplier = 252 * trading_hours * 60  # trading days*trading hours*minutes in an hour
         elif most_frequent_time_diff == pd.Timedelta(hours=1):
@@ -280,7 +280,7 @@ class Strategy:
           print ("Unknown Frequency")  # Handle cases where the frequency is not clearly hourly or minutely
 
         risk_free_rate = 0.02 # annualized cash rate
-
+        print(f'Risk free rate:{risk_free_rate},Multiplier to annualize input returns:{multiplier}')
         analytics = {}
         analytics['Sharpe Ratio'] = ((returns.mean()*multiplier -risk_free_rate) / (returns.std()*np.sqrt(multiplier))).round(1)
         analytics['Sortino Ratio'] = (returns.mean()*np.sqrt(multiplier) / returns[returns < 0].std()).round(1)
