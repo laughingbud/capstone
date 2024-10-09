@@ -281,7 +281,7 @@ class Strategy:
           print ("Unknown Frequency")  # Handle cases where the frequency is not clearly hourly or minutely
 
         risk_free_rate = 0.02 # annualized cash rate
-        print(f'Risk free rate:{risk_free_rate},Multiplier to annualize input returns:{multiplier}')
+        #print(f'Risk free rate:{risk_free_rate},Multiplier to annualize input returns:{multiplier}')
         analytics = {}
         analytics['Sharpe Ratio'] = ((returns.mean()*multiplier -risk_free_rate) / (returns.std()*np.sqrt(multiplier))).round(1)
         analytics['Sortino Ratio'] = (returns.mean()*np.sqrt(multiplier) / returns[returns < 0].std()).round(1)
