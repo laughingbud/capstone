@@ -284,7 +284,7 @@ class Strategy:
         #print(f'Risk free rate:{risk_free_rate},Multiplier to annualize input returns:{multiplier}')
         analytics = {}
         analytics['Sharpe Ratio'] = ((returns.mean()*multiplier -risk_free_rate) / (returns.std()*np.sqrt(multiplier))).round(1)
-        analytics['Sortino Ratio'] = (returns.mean()*np.sqrt(multiplier) / returns[returns < 0].std()).round(1)
+        analytics['Sortino Ratio'] = ((returns.mean()*multiplier -risk_free_rate) / (returns[returns < 0].std()*np.sqrt(multiplier))).round(1)
         analytics['Max Drawdown'] = (returns.cummax() - returns.cumsum()).max()
         analytics['VaR(95%)'] = returns.quantile(0.05)
         analytics['Exp shortfall(95%)'] = returns[returns <= returns.quantile(0.05)].mean()
