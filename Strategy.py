@@ -269,7 +269,8 @@ class Strategy:
         if most_frequent_time_diff == pd.Timedelta(minutes=1) or most_frequent_time_diff == pd.Timedelta(hours=1):
           time_difference = returns[returns.index.date == returns.index.date[0]].index.max() - returns[returns.index.date == returns.index.date[0]].index.min()
           trading_hours = time_difference.total_seconds() / 3600
-          print(f'Trading hours:{trading_hours}')
+          trading_hours = 6.25 #override as issues when sample is split intraday
+          #print(f'Trading hours:{trading_hours}')
         if most_frequent_time_diff == pd.Timedelta(minutes=1):
           multiplier = 252 * trading_hours * 60  # trading days*trading hours*minutes in an hour
         elif most_frequent_time_diff == pd.Timedelta(hours=1):
