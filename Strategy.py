@@ -159,7 +159,7 @@ class Strategy:
         volume_spike_signal = np.where(volume_spike, 1, np.where(~volume_spike, -1, 0))
         return volume_spike, volume_spike_signal
 
-    def atr_signal(self,data,window: int=14,smoothing_hl: int=7,threshold: float=1.0):
+    def atr_signal(self,data,window: int=14,ts_hl: int=120,smoothing_hl: int=20,threshold: float=1.0):
         # import talib
         # Calculate ATR
         # atr = talib.ATR(data['High'], data['low'], data['Close'], timeperiod=window)
@@ -173,10 +173,13 @@ class Strategy:
         lb = data['close'] - atr
         # Generate signals
         #signal = np.where(data['close'] > ub, -1, np.where(data['close'] < lb, 1, 0))
-        signal = np.where(atr_z < -1*threshold, 1, np.where(atr_z > threshold, -1, 0))
+        # signal = np.where(atr_z < -1*threshold, 1, np.where(atr_z > threshold, -1, 0))
         #signal = pd.DataFrame(signal,atr_z.index,columns=['signal'])
         #signal = pd.concat([signal,data['return'].reindex(signal.index)],axis=1)
-        return atr, ub, lb, signal
+
+        #alpha = 0.05*raw_sig.ewm(halflife=20).std()*atr_z
+        signal = np.where(atr_z<0,1,np.where(atr_z>0,-1,0))
+        return atr, ub, lb, atr_z, signal
 
     def donchian_channel_signal(self,data,window: int=20):
         high = data['High'].rolling(window=window).max()
