@@ -176,9 +176,9 @@ class Strategy:
         # signal = np.where(atr_z < -1*threshold, 1, np.where(atr_z > threshold, -1, 0))
         #signal = pd.DataFrame(signal,atr_z.index,columns=['signal'])
         #signal = pd.concat([signal,data['return'].reindex(signal.index)],axis=1)
-
+        #atr_z = atr_z.ewm(halflife=smoothing_hl).mean()
         #alpha = 0.05*raw_sig.ewm(halflife=20).std()*atr_z
-        signal = np.where(atr_z<0,1,np.where(atr_z>0,-1,0))
+        signal = np.where(atr_z<-1*threshold,1,np.where(atr_z>threshold,-1,0))
         return atr, ub, lb, atr_z, signal
 
     def donchian_channel_signal(self,data,window: int=20):
