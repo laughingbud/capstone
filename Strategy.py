@@ -159,7 +159,7 @@ class Strategy:
         volume_spike_signal = np.where(volume_spike, 1, np.where(~volume_spike, -1, 0))
         return volume_spike, volume_spike_signal
 
-    def atr_signal(self,data,window: int=14,smoothing_hl: int=7):
+    def atr_signal(self,data,window: int=14,smoothing_hl: int=7,threshold: float=1.0):
         # import talib
         # Calculate ATR
         # atr = talib.ATR(data['High'], data['low'], data['Close'], timeperiod=window)
