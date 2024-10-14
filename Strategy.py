@@ -182,19 +182,19 @@ class Strategy:
         return atr, ub, lb, atr_z, signal
 
     def donchian_channel_signal(self,data,window: int=20):
-        high = data['High'].rolling(window=window).max()
+        high = data['high'].rolling(window=window).max()
         low = data['low'].rolling(window=window).min()
         donchian_signal = np.where(data['close'] > high, -1, np.where(data['close'] < low, 1, 0))
         return high, low, donchian_signal
 
-    def keltner_channel_signal(self,data,window: int=20):
-        ewm = data['close'].ewm(span=window).mean()
+    def keltner_channel_signal(self,data,lookback_window: int=20, smoothing_window: int=10):
+        ewm = data['close'].ewm(span=smoothing_window).mean()
         atr = ta.volatility.AverageTrueRange(
-            data['High'],data['low'],data['close'],window).average_true_range()
+            data['high'],data['low'],data['close'],lookback_window).average_true_range()
         keltner_high = ewm + 2 * atr
         keltner_low = ewm - 2 * atr
-        # keltner_high = data['close'] + 2 * data['Close'].rolling(window=window).std()
-        # keltner_low = data['close'] - 2 * data['Close'].rolling(window=window).std()
+        # keltner_high = data['close'] + 2 * data['close'].rolling(window=window).std()
+        # keltner_low = data['close'] - 2 * data['close'].rolling(window=window).std()
         keltner_signal = np.where(data['close'] > keltner_high, -1, np.where(data['close'] < keltner_low, 1, 0))
         return keltner_high, keltner_low, keltner_signal
 
