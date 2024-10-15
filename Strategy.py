@@ -123,8 +123,9 @@ class Strategy:
     def macd_signal(self,data,window_slow: int=26,window_fast: int=1):
         if window_fast >= window_slow:
             raise ValueError("Fast window should be smaller than slow window")
-        macd = ta.trend.MACD(data['close'],window_slow,window_fast).macd
-        macd_calc = ta.trend.MACD(data['close'],window_slow,window_fast).macd_signal()
+        macd_indicator = ta.trend.MACD(data['close'],window_slow,window_fast)
+        macd = macd_indicator.macd()
+        macd_calc = macd_indicator.macd_signal()
         macd_signal = np.where(macd > macd_calc, 1, np.where(macd < macd_calc, -1, 0))
         return macd, macd_calc, macd_signal
 
