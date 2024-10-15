@@ -120,7 +120,7 @@ class Strategy:
         cci_signal = np.where(cci < -100, 1, np.where(cci > 100, -1, 0))
         return cci, cci_signal
 
-    def macd_signal(self,data,window_slow: int=26,window_fast: int=1):
+    def macd_signal(self,data,window_slow: int=26,window_fast: int=12):
         if window_fast >= window_slow:
             raise ValueError("Fast window should be smaller than slow window")
         macd_indicator = ta.trend.MACD(data['close'],window_slow,window_fast)
