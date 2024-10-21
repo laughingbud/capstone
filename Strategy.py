@@ -120,9 +120,12 @@ class Strategy:
         cci_signal = np.where(cci < -100, 1, np.where(cci > 100, -1, 0))
         return cci, cci_signal
 
-    def macd_signal(self,data,window_slow: int=26,window_fast: int=1):
-        macd = ta.trend.MACD(data['close'],window_slow,window_fast).macd
-        macd_calc = ta.trend.MACD(data['close'],window_slow,window_fast).macd_signal()
+    def macd_signal(self,data,window_slow: int=26,window_fast: int=12):
+        if window_fast >= window_slow:
+            raise ValueError("Fast window should be smaller than slow window")
+        macd_indicator = ta.trend.MACD(data['close'],window_slow,window_fast)
+        macd = macd_indicator.macd()
+        macd_calc = macd_indicator.macd_signal()
         macd_signal = np.where(macd > macd_calc, 1, np.where(macd < macd_calc, -1, 0))
         return macd, macd_calc, macd_signal
 
@@ -159,33 +162,42 @@ class Strategy:
         volume_spike_signal = np.where(volume_spike, 1, np.where(~volume_spike, -1, 0))
         return volume_spike, volume_spike_signal
 
-    def atr_signal(self,data,window: int=14):
+    def atr_signal(self,data,window: int=14,ts_hl: int=120,smoothing_hl: int=20,threshold: float=1.0):
         # import talib
         # Calculate ATR
         # atr = talib.ATR(data['High'], data['low'], data['Close'], timeperiod=window)
         atr = ta.volatility.AverageTrueRange(
             data['high'],data['low'],data['close'],window).average_true_range()
+        atr_z = ((atr[window-1:] - atr[window-1:].ewm(halflife=smoothing_hl).mean())/atr[window-1:].ewm(halflife=smoothing_hl).std())
+        atr_z = atr_z.dropna()
+
         # Calculate ATR Bands
         ub = data['close'] + atr
         lb = data['close'] - atr
         # Generate signals
-        signal = np.where(data['close'] > ub, -1, np.where(data['close'] < lb, 1, 0))
-        return atr, ub, lb, signal
+        #signal = np.where(data['close'] > ub, -1, np.where(data['close'] < lb, 1, 0))
+        # signal = np.where(atr_z < -1*threshold, 1, np.where(atr_z > threshold, -1, 0))
+        #signal = pd.DataFrame(signal,atr_z.index,columns=['signal'])
+        #signal = pd.concat([signal,data['return'].reindex(signal.index)],axis=1)
+        #atr_z = atr_z.ewm(halflife=smoothing_hl).mean()
+        #alpha = 0.05*raw_sig.ewm(halflife=20).std()*atr_z
+        signal = np.where(atr_z<-1*threshold,1,np.where(atr_z>threshold,-1,0))
+        return atr, ub, lb, atr_z, signal
 
     def donchian_channel_signal(self,data,window: int=20):
-        high = data['High'].rolling(window=window).max()
+        high = data['high'].rolling(window=window).max()
         low = data['low'].rolling(window=window).min()
         donchian_signal = np.where(data['close'] > high, -1, np.where(data['close'] < low, 1, 0))
         return high, low, donchian_signal
 
-    def keltner_channel_signal(self,data,window: int=20):
-        ewm = data['close'].ewm(span=window).mean()
+    def keltner_channel_signal(self,data,lookback_window: int=20, smoothing_window: int=10):
+        ewm = data['close'].ewm(span=smoothing_window).mean()
         atr = ta.volatility.AverageTrueRange(
-            data['High'],data['low'],data['close'],window).average_true_range()
+            data['high'],data['low'],data['close'],lookback_window).average_true_range()
         keltner_high = ewm + 2 * atr
         keltner_low = ewm - 2 * atr
-        # keltner_high = data['close'] + 2 * data['Close'].rolling(window=window).std()
-        # keltner_low = data['close'] - 2 * data['Close'].rolling(window=window).std()
+        # keltner_high = data['close'] + 2 * data['close'].rolling(window=window).std()
+        # keltner_low = data['close'] - 2 * data['close'].rolling(window=window).std()
         keltner_signal = np.where(data['close'] > keltner_high, -1, np.where(data['close'] < keltner_low, 1, 0))
         return keltner_high, keltner_low, keltner_signal
 
