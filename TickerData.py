@@ -343,7 +343,8 @@ class TickerData:
                 df.columns = [col.strip() for col in df.columns]
                 new_columns = [col.replace('<', '').replace('>', '') for col in df.columns]
                 df.columns = new_columns
-
+                df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
+                
                 if len(dataframes)>0:
                     if not len(df.columns)==len(dataframes[0].columns):
                         print(f'Actual number of columns {len(df.columns)}')
