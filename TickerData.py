@@ -291,7 +291,7 @@ class TickerData:
 
             # ticker_dict[ticker] = {"files":[file for file in csv_files if ticker in file]
             #                        }
-            ticker_dict[ticker] = {"files":[file for file in csv_files if file.split('/')[5].startswith(ticker+'_') and "Missing" not in file.split('/')[4]]
+            ticker_dict[ticker] = {"files":[file for file in csv_files if file.split('/')[5].startswith(ticker) and "Missing" not in file.split('/')[4]]
                         }
             ticker_dict[ticker]['months'] = list(set([file.split('/')[4] for file in ticker_dict[ticker]['files'] if "Missing" not in file.split('/')[4]]))
             ticker_dict[ticker]['n_months'] = len(set(ticker_dict[ticker]['months']))
