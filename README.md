@@ -8,7 +8,16 @@ We aim to explore multi-market and trading sessions for intra-day trading opport
 !pip install git+https://github.com/laughing-bud/capstone.git
 
 ### **Usage**:
-The jupyter notebook is currently work in progress. We have done exploratory work which should be visible and bit self explanatory.
+There are multiple version of jupyter notebooks. We have done exploratory work which should be visible (link in below section) and bit self explanatory.
+We cover Bollinger Bands, Average True Range(ATR), Keltner channel and MACD in the following notebook:
+https://github.com/laughingbud/capstone/blob/main/Ditesh-Seasonality%2CBB%2CATR%2CKeltner%2CMACD%2CTcosts.ipynb
+
+We cover Oscillators in the following notebook:
+https://github.com/laughingbud/capstone/blob/main/Alex-Oscillators.ipynb
+
+Seasonality is covered in the following notebook:
+https://github.com/laughingbud/capstone/blob/main/Capstone_v0_03_2.ipynb
+
 
 ### Exploratory research
 You can go through the full research here: https://github.com/laughingbud/capstone/blob/main/Exploratory_research.md
