@@ -290,8 +290,8 @@ class Strategy:
         elif most_frequent_time_diff == pd.Timedelta(days=1):
           multiplier = 252  # trading days
         else:
-          print ("Unknown Frequency. Assuming 'minutely'.")  # Handle cases where the frequency is not clearly hourly or minutely
-          multiplier = 252 * trading_hours * 60  # trading days*trading hours*minutes in an hour
+          #print ("Unknown Frequency. Assuming 'minutely'.")  # Handle cases where the frequency is not clearly hourly or minutely
+          multiplier = 252 * 6.25 * 60  # trading days*trading hours*minutes in an hour
             
         risk_free_rate = 0.02 # annualized cash rate
         #print(f'Risk free rate:{risk_free_rate},Multiplier to annualize input returns:{multiplier}')
