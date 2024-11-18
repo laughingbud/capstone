@@ -16,6 +16,9 @@ https://github.com/laughingbud/capstone/blob/main/Capstone_v0_03_2.ipynb
 https://github.com/laughingbud/capstone/blob/main/Yanqing-RSI%2CEMA%2CZ.ipynb
 5. The explanatory research is covered in this md file:
 https://github.com/laughingbud/capstone/blob/main/Exploratory_research.md
+6. The Solution Design document can be found below:
+https://github.com/laughingbud/capstone/blob/main/Solution%20Design%20document.pdf
+
 ### **Execution**
 To upload the git folder please use the following bash command:
 
