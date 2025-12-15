@@ -28,6 +28,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score
+from typing import Dict, Any
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -744,7 +745,7 @@ class trading_strategy:
         return best_lag
 
     @staticmethod
-    def strategy_stats(return_ts: pd.Series, trading_level: int = 100, risk_free_rate: float = 0.0) -> pd.Dict[str, Any]:
+    def strategy_stats(return_ts: pd.Series, trading_level: int = 100, risk_free_rate: float = 0.0) -> Dict[str, Any]:
         """
         Performs a comprehensive analysis of a trading strategy's return time series.
 
