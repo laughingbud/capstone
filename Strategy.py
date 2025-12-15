@@ -549,7 +549,7 @@ class Strategy:
 
         # Show the final strategy value
         print(f"Final Portfolio Value: {data['Strategy Value'].iloc[-1]:.2f}")
-        
+
 
 class trading_strategy:
     def __init__(self,prices):
@@ -744,7 +744,7 @@ class trading_strategy:
         return best_lag
 
     @staticmethod
-    def strategy_stats(return_ts: pd.Series, trading_level: int = 100, risk_free_rate: float = 0.0) -> Dict[str, Any]:
+    def strategy_stats(return_ts: pd.Series, trading_level: int = 100, risk_free_rate: float = 0.0) -> pd.Dict[str, Any]:
         """
         Performs a comprehensive analysis of a trading strategy's return time series.
 
