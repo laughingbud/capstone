@@ -549,3 +549,653 @@ class Strategy:
 
         # Show the final strategy value
         print(f"Final Portfolio Value: {data['Strategy Value'].iloc[-1]:.2f}")
+        
+
+class trading_strategy:
+    def __init__(self,prices):
+        self.prices = prices
+        self.returns = prices.pct_change(periods=1).dropna(how='all')
+        # self.strat_dict = strat_dict
+        # print(prices.info())
+        pass
+
+    def create_strategy(self,strat_dict):
+        self.strat_dict = strat_dict
+        lookback = self.strat_dict['lookback']
+        rebalance_freq = self.strat_dict['rebalance_freq'] # Get the desired frequency
+        strategy_type = self.strat_dict.get('strategy_type', 'long_short') # Added strategy_type with default
+
+        prices = self.prices
+        prices = prices.dropna(how='all')
+        if self.strat_dict.get('min_xs_count') is not None:
+            prices = prices[prices.count(axis=1)>=self.strat_dict.get('min_xs_count')]
+            # print(prices.head())
+        signal = prices.pct_change(periods=lookback)
+        # Reverse the sign on scores to reflect momentum vs mean reversion bets
+        if self.strat_dict['strategy'] == 'momentum':
+            multiplier = 1
+        elif self.strat_dict['strategy'] in ['reversion',
+                                             'mean-reversion',
+                                             'mean reversion',
+                                             'mean_reversion']:
+            multiplier = -1
+        else:
+            multiplier = 1
+
+        strategy_name = self.strat_dict['strategy'] #strategy name
+        print(f'Creating a {strategy_name} with lookback of {lookback} days.')
+        print(f'Rebalancing frequency: {rebalance_freq}')
+        print(f'Strategy Type: {strategy_type}') # Print the strategy type
+
+        signal = signal.dropna(how='all')*multiplier
+
+        xscored = pd.DataFrame() # Initialize xscored
+
+        if self.strat_dict['xscored']:
+            xscored = signal.sub(signal.mean(axis=1), axis=0).div(signal.std(axis=1),axis=0).dropna(how='all')
+
+        if 'lags' in self.strat_dict.keys():
+            lag_list = self.strat_dict['lags']
+        else:
+            lag_list = [1]
+
+        store_of_results = {}
+
+        for lag in lag_list:
+            # store_of_results['lag'+str(lag)] = {}
+            store_of_results[lag] = {}
+
+            # --- Target Weights Calculation (Daily) ---
+            # These are the weights we *would* take if we rebalance daily
+            target_weights = xscored.shift(lag).dropna(how='all')
+
+            # --- Apply Long-Only or Short-Only filter and scale to sum to 1 ---
+            if strategy_type == 'long_only':
+                target_weights[target_weights < 0] = 0 # Set negative weights to 0
+                # Scale positive weights to sum to 1
+                # target_weights = target_weights.div(target_weights.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+            # elif strategy_type == 'short_only':
+            #     target_weights[target_weights > 0] = 0 # Set positive weights to 0
+            #      # Scale absolute value of negative weights to sum to 1, then multiply by -1
+            #     target_weights = target_weights.abs().div(target_weights.abs().sum(axis=1).replace(0, np.nan), axis=0).fillna(0) * -1
+            elif strategy_type == 'long_short':
+                pass # Leave as is, already centered around zero if xscored
+            else:
+                raise ValueError(f"Invalid strategy_type: {strategy_type}")
+
+
+            # --- Determine Actual Held Positions based on Rebalancing Frequency ---
+            # 1. Align target weights with the returns index (important!)
+            target_weights, aligned_returns = target_weights.align(self.returns, join='inner', axis=0)
+
+            # 2. Identify rebalancing timestamps
+            # Use resample to get the end-of-period timestamps for the desired frequency
+            # Then select only those timestamps from our target_weights index
+            rebalance_timestamps = target_weights.resample(rebalance_freq).last().index
+            actual_rebalance_dates = target_weights.index.intersection(rebalance_timestamps)
+
+            # 3. Create boolean mask for rebalance days
+            # is_rebalance_day = target_weights.index.isin(actual_rebalance_dates)
+            is_rebalance_day = target_weights.index.isin(actual_rebalance_dates)
+
+
+            try:
+                held_positions = target_weights.where(pd.DataFrame(
+                    np.tile(is_rebalance_day, (target_weights.shape[1], 1)).T,
+                    index=target_weights.index,
+                    columns=target_weights.columns
+                )).ffill()
+            except ValueError as e:
+                print(f"ValueError occurred at .where(): {e}")
+                # Optional: Re-print shapes right before the error if needed
+                raise e # Re-raise the error after printing info
+
+            # --- Align held positions with returns again after ffill ---
+            held_positions, aligned_returns_final = held_positions.align(
+                aligned_returns, join='inner', axis=0)
+
+             # --- Calculate Gross Leverage ---
+            gross_leverage_org_strat = held_positions.abs().sum(axis=1)
+
+            # --- Calculate Raw Portfolio Returns (Based on Held Positions) ---
+            # Multiply the held weights by the *actual* daily returns
+            raw_portfolio_returns = (held_positions * aligned_returns_final).sum(axis=1)
+            raw_portfolio_returns = raw_portfolio_returns.dropna() # Drop any remaining NaNs
+
+            # --- Apply Min Cross-Sectional Count Filter (if applicable) ---
+            investable_idx = raw_portfolio_returns.index # Start with all days we have returns for
+
+
+            if self.strat_dict.get('min_xs_count') is not None:
+                min_xs_count = self.strat_dict['min_xs_count']
+
+                # Align xscored index before counting
+                aligned_xscored = xscored.reindex(raw_portfolio_returns.index)
+                # Find dates where the original signal had enough assets
+                valid_count_idx = aligned_xscored[aligned_xscored.count(axis=1) >= min_xs_count].index
+                # Intersect with the dates we have returns for
+                investable_idx = raw_portfolio_returns.index.intersection(valid_count_idx)
+
+
+            # Filter the raw returns based on investable index
+            filtered_portfolio_returns = raw_portfolio_returns.loc[investable_idx]
+
+            if self.strat_dict.get('target_vol') is not None:
+                target_vol = self.strat_dict['target_vol']
+                annualize_factor = np.sqrt(252)
+
+                sigma_tgt = target_vol / annualize_factor
+                lookback = self.strat_dict['lookback']
+                # rolling_vol = raw_strategy_returns.rolling(lookback).std().dropna(how='all')
+                rolling_vol = filtered_portfolio_returns.rolling(lookback).std().fillna(1.0)
+
+                scaling_factor = (sigma_tgt / rolling_vol).fillna(1.0)
+                # Cap scaling factor to avoid extreme leverage (e.g., max 3x)
+                scaling_factor = scaling_factor.clip(upper=3.0)
+            else:
+                scaling_factor = 1
+
+            # Apply scaling factor to the filtered returns
+            strategy_returns_final = filtered_portfolio_returns * scaling_factor
+            strategy_returns_final = strategy_returns_final.dropna() # Final dropna
+            gross_leverage_scaled_strat = held_positions.mul(scaling_factor,axis=0).dropna().sum(axis=1)
+
+            # --- Store Results ---
+            if not strategy_returns_final.empty:
+                store_of_results[lag] = self.strategy_stats(strategy_returns_final)
+                store_of_results[lag]['scaling_factor'] = scaling_factor
+                store_of_results[lag]['unscaled_returns'] = filtered_portfolio_returns
+                # Store gross leverage, aligned to the strategy_returns_final index
+                store_of_results[lag]['gross_leverage_ts'] = gross_leverage_scaled_strat.reindex(strategy_returns_final.index)
+
+                # Store asset returns and scaled holdings for the best lag
+                store_of_results[lag]['asset_returns'] = aligned_returns_final.reindex(strategy_returns_final.index)
+                store_of_results[lag]['unscaled_holdings'] = held_positions
+                store_of_results[lag]['scaled_holdings'] = held_positions.mul(scaling_factor,axis=0).dropna()
+
+
+            else:
+                 print(f"Warning: No valid strategy returns generated for lag {lag} with current settings.")
+                 store_of_results[lag] = {} # Store empty dict if no returns\
+
+        # Find max sharpe ratio lead/lag
+        max_sharpe = -np.inf
+        best_lag = None
+
+        for lag, stats in store_of_results.items():
+            if 'sharpe_ratio' in stats and stats['sharpe_ratio'] > max_sharpe:
+                max_sharpe = stats['sharpe_ratio']
+                best_lag = lag
+
+        print(f"The lead/lag with the maximum Sharpe ratio is: {best_lag}")
+        print(f"Maximum Sharpe Ratio: {max_sharpe:.4f}")
+
+        return store_of_results
+
+    def get_best_lag(self,store_of_results):
+        # Find max sharpe ratio lead/lag
+        max_sharpe = -np.inf
+        best_lag = None
+
+        for lag, stats in store_of_results.items():
+            if 'sharpe_ratio' in stats and stats['sharpe_ratio'] > max_sharpe:
+                max_sharpe = stats['sharpe_ratio']
+                best_lag = lag
+        return best_lag
+
+    @staticmethod
+    def strategy_stats(return_ts: pd.Series, trading_level: int = 100, risk_free_rate: float = 0.0) -> Dict[str, Any]:
+        """
+        Performs a comprehensive analysis of a trading strategy's return time series.
+
+        This function provides a suite of analytics crucial for a quantitative researcher
+        or portfolio manager to evaluate a strategy's performance, risk, and robustness.
+
+        Args:
+            return_ts (pd.Series): A pandas Series of daily returns, with a DatetimeIndex.
+            trading_level (int, optional): The notional trading level to calculate PnL. Defaults to 100.
+            risk_free_rate (float, optional): The annualized risk-free rate for calculations. Defaults to 0.0.
+
+        Returns:
+            Dict[str, Any]: A dictionary containing a wide range of performance and risk metrics.
+        """
+        if not isinstance(return_ts.index, pd.DatetimeIndex):
+            raise ValueError("Input 'return_ts' must have a DatetimeIndex.")
+
+        # Ensure return_ts is truly a Series (not a single-column DataFrame)
+        if isinstance(return_ts, pd.DataFrame):
+            if return_ts.shape[1] == 1:
+                return_ts = return_ts.iloc[:, 0] # Convert to Series
+            else:
+                raise ValueError("Input 'return_ts' must be a Series or a single-column DataFrame.")
+
+        results = {}
+
+        # --- Constants ---
+        TRADING_DAYS_PER_YEAR = 252
+        daily_risk_free_rate = (1 + risk_free_rate)**(1/TRADING_DAYS_PER_YEAR) - 1
+
+        # --- 1. Top-Line Performance Metrics ---
+        total_days = len(return_ts)
+        if total_days == 0:
+            return {} # Return empty stats if no returns
+
+        # Use geometric mean for more accurate long-term annualized returns
+        geo_ann_return = (1 + return_ts).prod() ** (TRADING_DAYS_PER_YEAR / total_days) - 1
+
+        ann_volatility = return_ts.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+
+        # Ensure ann_volatility is a scalar float, handling potential Series or NaN from std()
+        if isinstance(ann_volatility, pd.Series):
+            if ann_volatility.empty:
+                ann_volatility = np.nan
+            else:
+                ann_volatility = ann_volatility.iloc[0] # Get the scalar value
+
+        # Sharpe Ratio: Measures excess return per unit of total risk
+        # Handle zero or NaN volatility explicitly before division
+        if pd.isna(ann_volatility) or ann_volatility == 0:
+            sharpe_ratio = np.nan
+        else:
+            sharpe_ratio = (geo_ann_return - risk_free_rate) / ann_volatility
+
+        results['annualized_return'] = geo_ann_return
+        results['annualized_volatility'] = ann_volatility
+        results['sharpe_ratio'] = sharpe_ratio
+
+        # --- 2. Downside Risk Analytics ---
+        # Focus on negative volatility, which is what we actually dislike.
+        downside_returns = return_ts[return_ts < daily_risk_free_rate].copy()
+        downside_deviation = downside_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+
+        # Ensure downside_deviation is a scalar float, handling potential Series or NaN
+        if isinstance(downside_deviation, pd.Series):
+            if downside_deviation.empty:
+                downside_deviation = np.nan
+            else:
+                downside_deviation = downside_deviation.iloc[0]
+
+        # Sortino Ratio: Like Sharpe, but only penalizes for downside volatility.
+        if pd.isna(downside_deviation) or downside_deviation == 0:
+            sortino_ratio = np.nan
+        else:
+            sortino_ratio = (geo_ann_return - risk_free_rate) / downside_deviation
+
+        results['downside_deviation'] = downside_deviation
+        results['sortino_ratio'] = sortino_ratio
+
+        # --- 3. Drawdown Analysis ---
+        # This section is critical. It tells us about the pain the strategy endures.
+        equity_curve = (1 + return_ts).cumprod()
+        high_water_mark = equity_curve.cummax()
+        drawdown_series = (equity_curve / high_water_mark) - 1
+
+        max_drawdown = drawdown_series.min()
+
+        # Calmar Ratio: Return relative to the max drawdown. A measure of risk-adjusted return from a drawdown perspective.
+        if max_drawdown == 0 or pd.isna(max_drawdown):
+            calmar_ratio = np.nan
+        else:
+            calmar_ratio = geo_ann_return / abs(max_drawdown)
+
+        # Calculate Drawdown Duration
+        drawdown_end_date = drawdown_series.idxmin()
+        try:
+            drawdown_start_date = high_water_mark.loc[:drawdown_end_date][high_water_mark == high_water_mark.loc[drawdown_end_date]].index[0]
+            # Find recovery date: first time equity curve exceeds the HWM at the start of the drawdown
+            recovery_mask = equity_curve.loc[drawdown_end_date:] > high_water_mark.loc[drawdown_start_date]
+            if recovery_mask.any():
+                recovery_date = recovery_mask.idxmax()
+                drawdown_duration = (recovery_date - drawdown_start_date).days
+            else:
+                recovery_date = None # Strategy never recovered
+                drawdown_duration = np.nan
+        except IndexError:
+            drawdown_start_date, recovery_date, drawdown_duration = None, None, 0
+
+        results['max_drawdown'] = max_drawdown
+        results['calmar_ratio'] = calmar_ratio
+        results['max_drawdown_start'] = drawdown_start_date
+        results['max_drawdown_peak'] = drawdown_end_date
+        results['max_drawdown_recovery'] = recovery_date
+        results['max_drawdown_duration_days'] = drawdown_duration
+
+        # --- 4. Distributional & Win/Loss Statistics ---
+        # Understand the nature of the returns themselves.
+        win_rate = (return_ts > 0).mean()
+        avg_win = return_ts[return_ts > 0].mean()
+        avg_loss = return_ts[return_ts < 0].mean()
+
+        # Skew: Is the strategy prone to rare, large losses (negative skew)?
+        # Kurtosis: Does the strategy have "fat tails"?
+        skewness = return_ts.skew()
+        kurtosis = return_ts.kurtosis() # Pandas calculates excess kurtosis (Normal = 0)
+
+        # Tail Ratio: Ratio of 95th percentile gains to 5th percentile losses (95th / abs(5th))
+        percentile_95 = return_ts.quantile(0.95)
+        percentile_05 = return_ts.quantile(0.05)
+        tail_ratio = percentile_95 / abs(percentile_05) if percentile_05 != 0 else np.nan
+
+        results['win_rate'] = win_rate
+        results['avg_win_return'] = avg_win
+        results['avg_loss_return'] = avg_loss
+        results['profit_factor'] = abs(avg_win / avg_loss) if avg_loss != 0 else np.nan
+        results['max_drawdown_recovery'] = recovery_date
+        results['max_drawdown_duration_days'] = drawdown_duration
+
+        # --- 4. Distributional & Win/Loss Statistics ---
+        # Understand the nature of the returns themselves.
+        win_rate = (return_ts > 0).mean()
+        avg_win = return_ts[return_ts > 0].mean()
+        avg_loss = return_ts[return_ts < 0].mean()
+
+        # Skew: Is the strategy prone to rare, large losses (negative skew)?
+        # Kurtosis: Does the strategy have "fat tails"?
+        skewness = return_ts.skew()
+        kurtosis = return_ts.kurtosis() # Pandas calculates excess kurtosis (Normal = 0)
+
+        # Tail Ratio: Ratio of 95th percentile gains to 5th percentile losses (95th / abs(5th))
+        percentile_95 = return_ts.quantile(0.95)
+        percentile_05 = return_ts.quantile(0.05)
+        tail_ratio = percentile_95 / abs(percentile_05) if percentile_05 != 0 else np.nan
+
+        # results['win_rate'] = win_rate
+        # results['avg_win_return'] = avg_win
+        # results['avg_loss_return'] = avg_loss
+        # results['profit_factor'] = abs(avg_win / avg_loss) if avg_loss != 0 else np.nan
+        results['skewness'] = skewness
+        results['kurtosis'] = kurtosis
+        results['tail_ratio_95_05'] = tail_ratio
+
+        # --- 5. PnL and Equity Curves ---
+        # Store the core time series for plotting and further analysis.
+        # strategy_cmlpnl = (return_ts * trading_level).cumsum()
+        # strategy_pnl = return_ts * trading_level
+        strategy_pnl = return_ts
+        strategy_cmlpnl = (1 + return_ts).cumprod()
+        results['strategy_pnl_ts'] = strategy_pnl
+        results['strategy_cmlpnl_ts'] = strategy_cmlpnl
+        results['equity_curve_ts'] = equity_curve
+        results['drawdown_ts'] = drawdown_series
+        results['raw_returns_ts'] = return_ts
+
+        return results
+
+    # --- NEW: Visualization Function ---
+    @staticmethod
+    def plot_strategy_comparison(
+        results_dict: Dict[Any, Dict[str, Any]],
+        title=None,
+        primary_metric: str = 'sharpe_ratio',
+        plot_pnl: bool = False,
+        rolling_window: int = 126,
+        save_chart:bool = False,
+    ) -> None:
+        """
+        Generates a 2x2 dashboard to visually compare strategy backtest results.
+
+        Args:
+            results_dict (Dict): A dictionary where keys are strategy parameters (e.g., lead-lags)
+                                 and values are the output from the strategy_stats function.
+            primary_metric (str): The main metric to compare in the bar chart.
+                                  Options: 'sharpe_ratio', 'sortino_ratio', 'calmar_ratio', 'win_rate'.
+            plot_pnl (bool): If True, plots cumulative PnL instead of the equity curve in the first subplot.
+            rolling_window (int): The window (in days) for the rolling Sharpe ratio calculation. Default is 126 (approx. 6 months).
+        """
+        if not results_dict:
+            print("Results dictionary is empty. Nothing to plot.")
+            return
+
+        # --- Setup Plotting Environment ---
+        plt.style.use('seaborn-v0_8-whitegrid')
+        fig, axes = plt.subplots(3, 2, figsize=(18, 14))
+        chart_title = 'Strategy Comparison Dashboard' if title is None else title+' Strategy Comparison Dashboard'
+        fig.suptitle(chart_title, fontsize=20, weight='bold')
+
+        # --- 1. Top-Left: Equity Curve / PnL Evolution ---
+        ax1 = axes[0, 0]
+        plot_type = 'strategy_pnl_ts' if plot_pnl else 'equity_curve_ts'
+        y_label = 'Cumulative PnL' if plot_pnl else 'Equity Curve (Starts at 1)'
+
+        for key, data in results_dict.items():
+            data[plot_type].plot(ax=ax1, label=key)
+
+        ax1.set_title('Performance Trajectory', fontsize=14, weight='bold')
+        ax1.set_ylabel(y_label)
+        ax1.legend(title='Lead-Lags')
+        ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+        # --- 2. Top-Right: Primary Metric Comparison ---
+        ax2 = axes[0, 1]
+        metric_values = {str(k): v[primary_metric] for k, v in results_dict.items() if primary_metric in v}
+        metric_series = pd.Series(metric_values)#.sort_values()
+
+        colors = plt.cm.viridis(np.linspace(0.4, 0.95, len(metric_series)))
+        bars = ax2.bar(metric_series.index, metric_series.values, color=colors)
+
+        # Add Calmar Ratio as scatter points on a secondary y-axis
+        ax2_twin = ax2.twinx()
+        calmar_values = {str(k): v['calmar_ratio'] for k, v in results_dict.items() if 'calmar_ratio' in v}
+        calmar_series = pd.Series(calmar_values)
+        ax2_twin.scatter(calmar_series.index, calmar_series.values, color='red', label='Calmar Ratio', zorder=5)
+        ax2_twin.set_ylabel('Calmar Ratio', color='red')
+        ax2_twin.tick_params(axis='y', labelcolor='red')
+        ax2_twin.legend(loc='upper left')
+
+
+        # Align the primary and secondary y-axes
+        ax2.yaxis.set_major_formatter(plt.FuncFormatter('{:.2f}'.format))
+        ax2_twin.yaxis.set_major_formatter(plt.FuncFormatter('{:.2f}'.format))
+        ax2.figure.canvas.draw()  # Draw the canvas to update tick locations
+
+        # Get the tick locations for both axes
+        ax2_ticks = ax2.get_yticks()
+        ax2_twin_ticks = ax2_twin.get_yticks()
+
+        # Determine the combined minimum and maximum values
+        all_values = np.concatenate([metric_series.values, calmar_series.values])
+        min_val = np.min(all_values)
+        max_val = np.max(all_values)
+
+        # Set the limits for both axes to include all values
+        ax2.set_ylim(min_val * 1.1, max_val * 1.1)
+        ax2_twin.set_ylim(min_val * 1.1, max_val * 1.1)
+
+
+        ax2.bar_label(bars, fmt='%.3f', padding=5)
+        ax2.set_title(f'{primary_metric.replace("_", " ").title()} Comparison', fontsize=14, weight='bold')
+        ax2.set_ylabel(primary_metric.replace("_", " ").title())
+        # ax2.set_xlim(left=min(0, metric_series.min() * 1.1))
+
+        # --- 3. Bottom-Left: Drawdown Comparison ---
+        ax3 = axes[1, 0]
+        drawdown_values = {str(k): v['max_drawdown'] for k, v in results_dict.items() if 'max_drawdown' in v}
+        drawdown_series = pd.Series(drawdown_values).sort_values(ascending=False)
+
+        bars = ax3.bar(drawdown_series.index, drawdown_series.values, color='indianred')
+        ax3.bar_label(bars, fmt='{:.2%}', padding=3)
+        ax3.yaxis.set_major_formatter(plt.FuncFormatter('{:.0%}'.format))
+        ax3.set_title('Maximum Drawdown', fontsize=14, weight='bold')
+        ax3.set_ylabel('Peak-to-Trough Loss')
+
+        # --- 4. Bottom-Right: Evolution of Gross Leverage ---
+        ax4 = axes[1, 1]
+        max_sharpe = -np.inf
+        best_lag = None
+
+        for lag, stats in results_dict.items():
+            if 'sharpe_ratio' in stats and stats['sharpe_ratio'] > max_sharpe:
+                max_sharpe = stats['sharpe_ratio']
+                best_lag = lag
+
+        # print(f"The lag with the maximum Sharpe ratio is: {best_lag}")
+        # print(f"Maximum Sharpe Ratio: {max_sharpe:.4f}")
+
+        if 'gross_leverage_ts' in results_dict[best_lag]:
+              results_dict[best_lag]['gross_leverage_ts'].plot(ax=ax4, label=best_lag)
+        else:
+              print(f"Warning: 'gross_leverage_ts' not found for strategy {best_lag}. Skipping plot.")
+
+        ax4.set_title('Evolution of Gross Leverage', fontsize=14, weight='bold')
+        ax4.set_ylabel('Gross Leverage')
+        ax4.legend(title='Lead-Lags')
+        ax4.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+        # --- 5. Best sharpe ratio
+        ax5 = axes[2,0]
+        # Access asset returns for the best lag
+        asset_returns = results_dict[best_lag]['asset_returns']
+
+        # Calculate annualized Sharpe ratio for each asset
+        annualize_factor = np.sqrt(252)
+        asset_sharpe_ratios = (asset_returns.mean() / asset_returns.std()) * annualize_factor
+
+        # Handle potential division by zero
+        asset_sharpe_ratios = asset_sharpe_ratios.replace([np.inf, -np.inf], np.nan).dropna()
+
+        asset_sharpe_ratios.sort_values(ascending=False).plot(ax=ax5,kind='bar')
+        ax5.set_title(f'Annualized Sharpe Ratio by Asset for Best Lag ({best_lag})')
+        ax5.set_xlabel('Asset')
+        ax5.set_ylabel('Annualized Sharpe Ratio')
+        # plt.xticks(rotation=45, ha='right')
+
+
+        # --- 6. Best sharpe ratio
+        ax6 = axes[2,1]
+        # Access scaled holdings for the best lag
+        scaled_holdings = results_dict[best_lag]['scaled_holdings']
+
+        # Iterate and plot each asset's scaled holdings
+        for column in scaled_holdings.columns:
+            scaled_holdings[column].plot(label=column,ax=ax6)
+
+        # Set plot title and labels
+        ax6.set_title(f'Scaled Holdings Evolution by Asset for Best Lag ({best_lag})')
+
+        # --- Final Touches ---
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        if save_chart:
+            plt.savefig('strategy_dashboard.png')
+        # plt.show() # Removed this plt.show() to avoid flickering when other plots are generated
+
+    # ---
+    # --- NEW: Walk-Forward Optimization (WFO) Function
+    # ---
+
+def run_walk_forward_optimization(
+    all_prices: pd.DataFrame,
+    all_returns: pd.DataFrame,
+    base_strat_dict: dict,
+    in_sample_window: pd.DateOffset,
+    out_of_sample_window: pd.DateOffset,
+    start_date: pd.Timestamp
+) -> (pd.Series, Dict[str, Any]):
+    """
+    Performs a walk-forward optimization on the trading strategy.
+
+    Args:
+        all_prices: DataFrame of all historical prices.
+        all_returns: DataFrame of all historical returns.
+        base_strat_dict: The base strategy configuration dictionary.
+        in_sample_window: A DateOffset object for the training period (e.g., pd.DateOffset(years=5)).
+        out_of_sample_window: A DateOffset object for the trading period (e.g., pd.DateOffset(months=3)).
+        start_date: The timestamp to begin the first in-sample period.
+
+    Returns:
+        A tuple containing:
+        - The stitched-together out-of-sample returns Series.
+        - The final stats dictionary from running strategy_stats on the OOS series.
+    """
+
+    oos_returns_list = []
+    current_date = start_date
+    end_date = all_prices.index.max()
+
+    print("="*40)
+    print("Starting Walk-Forward Optimization...")
+    print(f"In-Sample Window: {in_sample_window}")
+    print(f"Out-of-Sample Window: {out_of_sample_window}")
+    print("="*40)
+
+    while current_date + in_sample_window + out_of_sample_window <= end_date:
+        # 1. Define window boundaries
+        is_start_date = current_date
+        is_end_date = current_date + in_sample_window
+        oos_start_date = is_end_date + pd.DateOffset(days=1)
+        oos_end_date = is_end_date + out_of_sample_window
+
+        print(f"\nProcessing Window:")
+        print(f"  In-Sample:   {is_start_date.date()} to {is_end_date.date()}")
+        print(f"  Out-of-Sample: {oos_start_date.date()} to {oos_end_date.date()}")
+
+        # 2. Slice data
+        is_prices = all_prices.loc[is_start_date:is_end_date]
+        # is_returns is not directly used for strategy calculation, only prices are needed
+        # is_returns = all_returns.loc[is_start_date:is_end_date]
+        oos_prices = all_prices.loc[oos_start_date:oos_end_date]
+        # oos_returns = all_returns.loc[oos_start_date:oos_end_date] # This was the problematic line, now replaced by portfolio returns
+
+        if is_prices.empty or oos_prices.empty:
+            print("  Skipping window: Not enough data.")
+            current_date += out_of_sample_window # Slide to next window
+            continue
+
+        # 3. Optimize In-Sample to find best lag
+        # Initialize strategy object with In-Sample data
+        ts_in_sample = trading_strategy(is_prices)
+        # ts_in_sample = ts.create_strategy(base_strat_dict)
+        # Run create_strategy to test all lags and get the best one
+        store_of_results = ts_in_sample.create_strategy(base_strat_dict)
+        best_lag = ts_in_sample.get_best_lag(store_of_results)
+
+        if best_lag is None:
+            print("  Skipping window: No best lag found in-sample.")
+            current_date += out_of_sample_window
+            continue
+
+        print(f"  Found Best In-Sample Lag: {best_lag}")
+
+        # 4. Test Out-of-Sample using ONLY the best_lag
+        # Initialize a new strategy object for the OOS test, using the OOS prices
+        ts_out_of_sample = trading_strategy(oos_prices)
+
+        # Create a temporary strat_dict for OOS testing, focusing only on the best_lag
+        oos_strat_dict = base_strat_dict.copy()
+        oos_strat_dict['lags'] = [best_lag] # Only test the best lag
+        # Ensure plot is False for OOS to avoid generating plots repeatedly during WFO
+        oos_strat_dict['plot'] = False # Assuming 'plot' might be a key in base_strat_dict
+
+        # Run the strategy creation for the OOS period with the best_lag
+        oos_results = ts_out_of_sample.create_strategy(oos_strat_dict)
+
+        # Extract the final portfolio returns for the best_lag from the OOS results
+        if best_lag in oos_results and 'raw_returns_ts' in oos_results[best_lag]:
+            oos_portfolio_returns = oos_results[best_lag]['raw_returns_ts']
+            if not oos_portfolio_returns.empty:
+                print(f"  OOS Period generated {len(oos_portfolio_returns)} portfolio returns.")
+                oos_returns_list.append(oos_portfolio_returns)
+            else:
+                print("  Skipping window: No valid portfolio returns generated in OOS period.")
+        else:
+            print(f"  Skipping window: Results for best lag ({best_lag}) not found or no raw_returns_ts in OOS period.")
+
+        # 5. Slide the window
+        current_date += out_of_sample_window
+
+    print("\n" + "="*40)
+    print("Walk-Forward Optimization Complete.")
+
+    if not oos_returns_list:
+        print("Error: No OOS returns were generated. Check data range and window sizes.")
+        return pd.Series(dtype=float), {}
+
+    # 6. Stitch all OOS returns together
+    final_oos_returns = pd.concat(oos_returns_list)
+    final_oos_returns = final_oos_returns.loc[~final_oos_returns.index.duplicated(keep='first')] # Handle overlaps
+
+    print(f"Total OOS returns stitched: {len(final_oos_returns)}")
+
+    # 7. Calculate final stats on the *realistic* OOS equity curve
+    final_stats = trading_strategy.strategy_stats(final_oos_returns, 100, base_strat_dict.get('risk_free_rate', 0.0))
+
+    return final_oos_returns, final_stats
