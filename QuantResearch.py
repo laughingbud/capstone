@@ -41,6 +41,8 @@ from __future__ import annotations
 import os
 import re
 import glob
+import json
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -711,6 +713,118 @@ def plot_dashboard(
 
 
 # ---------------------------------------------------------------------------
+# 3b. Results persistence (track & compare runs over time)
+# ---------------------------------------------------------------------------
+#: Config keys recorded alongside each run for cross-run comparison.
+_RUN_CONFIG_KEYS = [
+    "frequency", "contract", "cost_bps", "target_vol", "intraday",
+    "vol_window", "max_leverage", "n_assets",
+]
+
+
+def save_run(
+    results: Sequence[BacktestResult],
+    out_dir: str = "results",
+    run_name: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+    save_returns: bool = True,
+) -> str:
+    """Persist a batch of backtests so runs can be compared over time.
+
+    Creates ``<out_dir>/<run_id>/`` containing:
+
+    * ``metrics.csv``     -- the metric table (one row per strategy)
+    * ``returns.parquet`` -- wide ``time x strategy`` OOS net returns
+      (and ``gross_returns.parquet`` when available, for cost re-analysis)
+    * ``meta.json``       -- run config + per-strategy chosen parameters
+
+    and appends one row per strategy to the cumulative master log
+    ``<out_dir>/runs_log.csv`` -- the file to read when tracking how a strategy's
+    performance drifts across data, costs or parameter changes.
+
+    Returns
+    -------
+    str
+        The created run directory.
+    """
+    config = dict(config or {})
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = f"{ts}_{run_name}" if run_name else ts
+    run_dir = os.path.join(out_dir, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    report(results).to_csv(os.path.join(run_dir, "metrics.csv"))
+
+    if save_returns:
+        nets = {r.name: r.returns for r in results if r.returns is not None}
+        if nets:
+            pd.DataFrame(nets).sort_index().to_parquet(
+                os.path.join(run_dir, "returns.parquet")
+            )
+        gross = {r.name: r.gross_returns for r in results if r.gross_returns is not None}
+        if gross:
+            pd.DataFrame(gross).sort_index().to_parquet(
+                os.path.join(run_dir, "gross_returns.parquet")
+            )
+
+    meta = {
+        "run_id": run_id,
+        "created_utc": ts,
+        "config": config,
+        "strategies": {
+            r.name: {
+                "kind": r.meta.get("kind"),
+                "chosen_params": r.meta.get("chosen_params", r.meta.get("params")),
+            }
+            for r in results
+        },
+    }
+    with open(os.path.join(run_dir, "meta.json"), "w") as fh:
+        json.dump(meta, fh, indent=2, default=str)
+
+    # Append to the cumulative master log (long format: one row per strategy).
+    rows = []
+    for r in results:
+        row: Dict[str, Any] = {"run_id": run_id, "created_utc": ts, "strategy": r.name}
+        row.update({k: config.get(k) for k in _RUN_CONFIG_KEYS})
+        row.update({k: r.metrics.get(k) for k in _METRIC_KEYS})
+        rows.append(row)
+    log_path = os.path.join(out_dir, "runs_log.csv")
+    pd.DataFrame(rows).to_csv(
+        log_path, mode="a", header=not os.path.exists(log_path), index=False
+    )
+    print(f"[save_run] wrote {run_dir}; appended {len(rows)} rows to {log_path}")
+    return run_dir
+
+
+def load_run(run_dir: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Dict[str, Any]]:
+    """Load a saved run -> ``(metrics_df, returns_df_or_None, meta_dict)``."""
+    metrics = pd.read_csv(os.path.join(run_dir, "metrics.csv"), index_col=0)
+    rpath = os.path.join(run_dir, "returns.parquet")
+    returns = pd.read_parquet(rpath) if os.path.exists(rpath) else None
+    with open(os.path.join(run_dir, "meta.json")) as fh:
+        meta = json.load(fh)
+    return metrics, returns, meta
+
+
+def compare_runs(
+    out_dir: str = "results", metric: str = "sharpe", pivot: bool = True
+) -> pd.DataFrame:
+    """Read the cumulative ``runs_log.csv`` for cross-run comparison.
+
+    With ``pivot=True`` (default) returns a ``strategy x run_id`` table of
+    *metric*; otherwise the raw long-format log (all metrics + config).
+    """
+    log_path = os.path.join(out_dir, "runs_log.csv")
+    if not os.path.exists(log_path):
+        raise FileNotFoundError(f"No runs log at {log_path}; call save_run() first.")
+    log = pd.read_csv(log_path)
+    if not pivot:
+        return log
+    return log.pivot_table(index="strategy", columns="run_id", values=metric)
+
+
+# ---------------------------------------------------------------------------
 # 4. Strategy library
 # ---------------------------------------------------------------------------
 class Strategy:
@@ -1301,8 +1415,32 @@ class QuantLab:
 
     @staticmethod
     def plot(results: Sequence[BacktestResult], **kwargs: Any):
-        """Render the 2x2 performance dashboard (see :func:`plot_dashboard`)."""
+        """Render the 2x3 performance dashboard (see :func:`plot_dashboard`)."""
         return plot_dashboard(results, **kwargs)
+
+    def save(
+        self,
+        results: Sequence[BacktestResult],
+        run_name: Optional[str] = None,
+        out_dir: str = "results",
+    ) -> str:
+        """Persist *results* with this lab's run config auto-captured.
+
+        Writes a timestamped run folder and appends to ``results/runs_log.csv``
+        so runs can be compared over time (see :func:`save_run`,
+        :func:`compare_runs`).
+        """
+        config = {
+            "frequency": self.frequency,
+            "contract": self.contract,
+            "cost_bps": self.cost_bps,
+            "target_vol": self.target_vol,
+            "intraday": self.intraday,
+            "vol_window": self.vol_window,
+            "max_leverage": self.max_leverage,
+            "n_assets": len(self.market.data),
+        }
+        return save_run(results, out_dir=out_dir, run_name=run_name, config=config)
 
 
 if __name__ == "__main__":  # pragma: no cover - quick smoke run

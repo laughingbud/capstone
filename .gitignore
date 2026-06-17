@@ -2,6 +2,9 @@
 Data/.qr_cache/
 .qr_cache/
 
+# Saved backtest runs (artifacts; keep locally or commit selectively)
+results/
+
 # Python
 __pycache__/
 *.pyc
