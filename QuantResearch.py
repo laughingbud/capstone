@@ -174,10 +174,17 @@ class MarketData:
     data_dir:
         Root folder that contains the ``Futures IEOD-<Month> <Year>`` sub
         folders.  Defaults to ``"Data"`` relative to the working directory.
+    cache_dir:
+        Where to store resampled per-ticker parquet caches.  Reading the ~4900
+        raw minute CSVs and resampling is slow (~1-2 min for the full
+        universe); once a (ticker, contract, frequency) frame is built it is
+        written here and reused instantly on subsequent loads.  Defaults to
+        ``"<data_dir>/.qr_cache"``.
     """
 
-    def __init__(self, data_dir: str = "Data") -> None:
+    def __init__(self, data_dir: str = "Data", cache_dir: Optional[str] = None) -> None:
         self.data_dir = data_dir
+        self.cache_dir = cache_dir or os.path.join(data_dir, ".qr_cache")
         # {(ticker, contract): [csv_path, ...]} sorted chronologically-ish.
         self._index: Dict[Tuple[str, str], List[str]] = {}
         self.data: Dict[str, pd.DataFrame] = {}
@@ -251,6 +258,49 @@ class MarketData:
         # Drop empty buckets (weekends / non-trading periods).
         return out.dropna(how="all").dropna(subset=["Close"])
 
+    # -- caching -----------------------------------------------------------
+    def _cache_path(self, ticker: str, contract: str, freq: str) -> str:
+        safe_freq = freq.replace("/", "")  # offset aliases are filename-safe anyway
+        return os.path.join(
+            self.cache_dir, contract.upper(), safe_freq, f"{ticker.upper()}.parquet"
+        )
+
+    def _get_resampled(
+        self, ticker: str, contract: str, freq: str,
+        use_cache: bool, rebuild_cache: bool,
+    ) -> pd.DataFrame:
+        """Return the full-feature resampled frame, reading/writing the cache.
+
+        Raises ``KeyError`` (via :meth:`_load_one`) when no source file exists.
+        """
+        path = self._cache_path(ticker, contract, freq)
+        if use_cache and not rebuild_cache and os.path.exists(path):
+            try:
+                return pd.read_parquet(path)
+            except Exception as exc:  # corrupt cache -> rebuild
+                print(f"[MarketData] cache read failed for {ticker} ({exc}); rebuilding")
+
+        df = self._resample(self._load_one(ticker, contract), freq)
+        if use_cache:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                df.to_parquet(path)
+            except Exception as exc:
+                print(f"[MarketData] cache write failed for {ticker}: {exc}")
+        return df
+
+    def clear_cache(self, contract: Optional[str] = None, frequency: Optional[str] = None) -> None:
+        """Delete cached parquet files (optionally scoped to contract/frequency)."""
+        import shutil
+        target = self.cache_dir
+        if contract is not None:
+            target = os.path.join(target, contract.upper())
+            if frequency is not None:
+                target = os.path.join(target, FREQUENCY_ALIASES.get(frequency, frequency))
+        if os.path.exists(target):
+            shutil.rmtree(target)
+            print(f"[MarketData] cleared cache at {target}")
+
     def load(
         self,
         tickers: Optional[Sequence[str]] = None,
@@ -259,6 +309,8 @@ class MarketData:
         features: Optional[Sequence[str]] = None,
         start: Optional[str] = None,
         end: Optional[str] = None,
+        use_cache: bool = True,
+        rebuild_cache: bool = False,
     ) -> Dict[str, pd.DataFrame]:
         """Load historical bars.
 
@@ -276,6 +328,12 @@ class MarketData:
             Subset of ``Open, High, Low, Close, Volume, OI``; ``None`` keeps all.
         start, end:
             Optional ISO date strings to clip the sample.
+        use_cache:
+            Read/write the resampled per-ticker parquet cache (default True).
+            The first full-universe load is slow; later ones are near-instant.
+        rebuild_cache:
+            Ignore any existing cache and rebuild it from the raw CSVs (use
+            after the underlying data changes).
 
         Returns
         -------
@@ -295,11 +353,10 @@ class MarketData:
         for t in tickers:
             t = t.upper()
             try:
-                df = self._load_one(t, contract)
+                df = self._get_resampled(t, contract, freq, use_cache, rebuild_cache)
             except KeyError:
                 print(f"[MarketData] skip {t}: no {contract} file")
                 continue
-            df = self._resample(df, freq)
             cols = [c for c in features if c in df.columns]
             df = df[cols]
             if start is not None:
@@ -1165,8 +1222,9 @@ class QuantLab:
         vol_window: int = 20,
         max_leverage: float = 3.0,
         intraday: bool = False,
+        cache_dir: Optional[str] = None,
     ) -> None:
-        self.market = MarketData(data_dir)
+        self.market = MarketData(data_dir, cache_dir=cache_dir)
         self.classifier = TickerClassifier
         self.cost_bps = cost_bps
         self.target_vol = target_vol
@@ -1189,9 +1247,14 @@ class QuantLab:
         features: Optional[Sequence[str]] = None,
         start: Optional[str] = None,
         end: Optional[str] = None,
+        use_cache: bool = True,
+        rebuild_cache: bool = False,
     ) -> Dict[str, pd.DataFrame]:
         self.contract, self.frequency = contract, frequency
-        return self.market.load(tickers, contract, frequency, features, start, end)
+        return self.market.load(
+            tickers, contract, frequency, features, start, end,
+            use_cache=use_cache, rebuild_cache=rebuild_cache,
+        )
 
     def _close_panel(self, kind: str) -> pd.DataFrame:
         close = self.market.panel("Close")

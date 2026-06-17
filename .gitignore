@@ -1,0 +1,10 @@
+# QuantResearch parquet cache (rebuilt from Data/ on demand)
+Data/.qr_cache/
+.qr_cache/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
