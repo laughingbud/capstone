@@ -24,8 +24,9 @@ It provides one cohesive workflow exposed through the :class:`QuantLab` facade:
     drawdown, win rate, profit factor, avg win/loss, cagr, vol, skew, kurtosis).
     -> :func:`performance_metrics`
 
-The whole thing is dependency-light (numpy / pandas / scipy only) and reads the
-data straight from the local ``Data`` directory, so it runs outside Colab.
+The whole thing is dependency-light (numpy / pandas / scipy, plus optional
+matplotlib for plotting) and reads the data straight from the local ``Data``
+directory, so it runs outside Colab.
 
 Example
 -------
@@ -213,9 +214,16 @@ class MarketData:
     @staticmethod
     def _resample(df: pd.DataFrame, freq: str) -> pd.DataFrame:
         """Resample a 1-minute OHLCV+OI frame to *freq* (pandas offset alias)."""
-        if freq in ("1min", "1T"):
-            return df
         agg = {c: _OHLC_AGG[c] for c in df.columns if c in _OHLC_AGG}
+        if freq in ("1min", "1T"):
+            out = (
+                df.groupby(df.index.normalize(), group_keys=False)
+                .apply(lambda x: x.resample("1min").agg(agg))
+                .sort_index()
+            )
+            if "Close" in out.columns:
+                out.loc[out["Close"].isna()] = np.nan
+            return out
         out = df.resample(freq).agg(agg)
         # Drop empty buckets (weekends / non-trading periods).
         return out.dropna(how="all").dropna(subset=["Close"])
@@ -678,7 +686,7 @@ def _cross_sectional_weights(scores: pd.DataFrame, quantile: float = 0.2) -> pd.
 
 
 def _hurst(series: np.ndarray) -> float:
-    """Rescaled-range Hurst exponent of a 1-D array (NaN-safe, lightweight)."""
+    """Lagged-difference dispersion Hurst estimate of a 1-D array."""
     s = series[~np.isnan(series)]
     n = len(s)
     if n < 20:
@@ -704,7 +712,7 @@ class TSMomentum(Strategy):
 
     def generate_weights(self, close: pd.DataFrame) -> pd.DataFrame:
         lookback = int(self.params.get("lookback", 20))
-        signal = np.sign(close.pct_change(lookback))
+        signal = np.sign(close.pct_change(lookback, fill_method=None))
         return signal.fillna(0.0)
 
 
@@ -734,7 +742,7 @@ class TSSeasonality(Strategy):
     kind, name = "timeseries", "ts_seasonality"
 
     def generate_weights(self, close: pd.DataFrame) -> pd.DataFrame:
-        rets = close.pct_change()
+        rets = close.pct_change(fill_method=None)
         intraday = infer_periods_per_year(close.index) > 300  # finer than daily
         bucket = close.index.hour if intraday else close.index.dayofweek
         bucket = pd.Index(bucket, name="bucket")
@@ -762,7 +770,7 @@ class TSRegimeAdaptive(Strategy):
     def generate_weights(self, close: pd.DataFrame) -> pd.DataFrame:
         lookback = int(self.params.get("lookback", 20))
         hurst_window = int(self.params.get("hurst_window", 100))
-        mom = np.sign(close.pct_change(lookback))
+        mom = np.sign(close.pct_change(lookback, fill_method=None))
         z = _zscore(close, lookback)
         rev = -np.sign(z)
         w = pd.DataFrame(0.0, index=close.index, columns=close.columns)
@@ -791,7 +799,7 @@ class XSMomentum(Strategy):
     def generate_weights(self, close: pd.DataFrame) -> pd.DataFrame:
         lookback = int(self.params.get("lookback", 20))
         quantile = float(self.params.get("quantile", 0.2))
-        scores = close.pct_change(lookback)
+        scores = close.pct_change(lookback, fill_method=None)
         return _cross_sectional_weights(scores, quantile)
 
 
@@ -803,7 +811,7 @@ class XSMeanReversion(Strategy):
     def generate_weights(self, close: pd.DataFrame) -> pd.DataFrame:
         lookback = int(self.params.get("lookback", 5))
         quantile = float(self.params.get("quantile", 0.2))
-        scores = -close.pct_change(lookback)   # invert -> losers score high
+        scores = -close.pct_change(lookback, fill_method=None)   # invert -> losers score high
         return _cross_sectional_weights(scores, quantile)
 
 
@@ -819,7 +827,7 @@ class XSSeasonality(Strategy):
 
     def generate_weights(self, close: pd.DataFrame) -> pd.DataFrame:
         quantile = float(self.params.get("quantile", 0.2))
-        rets = close.pct_change()
+        rets = close.pct_change(fill_method=None)
         intraday = infer_periods_per_year(close.index) > 300
         bucket = pd.Index(
             rets.index.hour if intraday else rets.index.dayofweek, name="bucket"
@@ -847,7 +855,7 @@ class XSResidualMomentum(Strategy):
     def generate_weights(self, close: pd.DataFrame) -> pd.DataFrame:
         lookback = int(self.params.get("lookback", 20))
         quantile = float(self.params.get("quantile", 0.2))
-        rets = close.pct_change()
+        rets = close.pct_change(fill_method=None)
         market = rets.mean(axis=1)
         var_m = market.rolling(lookback).var()
         scores = pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float)
@@ -949,7 +957,7 @@ class Backtester:
 
     def run(self, strategy: Strategy, close: pd.DataFrame, name: Optional[str] = None) -> BacktestResult:
         raw_weights = strategy.generate_weights(close).reindex(close.index)
-        asset_rets = close.pct_change().reindex(close.index)
+        asset_rets = close.pct_change(fill_method=None).reindex(close.index)
 
         leverage = None
         weights = raw_weights
@@ -1097,6 +1105,11 @@ class WalkForwardValidator:
             return s[~s.index.duplicated(keep="first")]
 
         stitched = _stitch(oos_returns)
+        if stitched is None or stitched.empty:
+            raise ValueError(
+                "Walk-forward produced no out-of-sample returns; adjust train_span, "
+                "n_splits, or sample size."
+            )
         return BacktestResult(
             name=name or f"{strategy_cls.name}_wf",
             returns=stitched,
@@ -1207,7 +1220,7 @@ class QuantLab:
 
     @staticmethod
     def plot(results: Sequence[BacktestResult], **kwargs: Any):
-        """Render the 2x2 performance dashboard (see :func:`plot_dashboard`)."""
+        """Render the 2x3 performance dashboard (see :func:`plot_dashboard`)."""
         return plot_dashboard(results, **kwargs)
 
 
