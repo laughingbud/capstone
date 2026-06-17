@@ -548,8 +548,10 @@ def asset_sharpe_table(results: Sequence[BacktestResult]) -> pd.DataFrame:
     return pd.DataFrame(cols).sort_index()
 
 
-#: Default transaction-cost ladder (basis points) for sensitivity analysis.
+#: Default transaction-cost ladder (basis points) for daily/low-turnover work.
 DEFAULT_COST_LEVELS: List[float] = [1, 2, 5, 7, 10, 15, 20, 25]
+#: Default ladder for intraday/high-turnover work, where the edge lives sub-1bp.
+DEFAULT_INTRADAY_COST_LEVELS: List[float] = [round(0.1 * i, 2) for i in range(11)]
 
 
 def sharpe_vs_cost(
@@ -613,7 +615,10 @@ def plot_dashboard(
     log_equity:
         Plot the equity curve on a log scale.
     cost_levels:
-        Transaction-cost ladder (bps) for the degradation panel.
+        Transaction-cost ladder (bps) for the degradation panel.  When omitted
+        it defaults to :data:`DEFAULT_INTRADAY_COST_LEVELS` (0 -> 1 bp) for
+        intraday data and :data:`DEFAULT_COST_LEVELS` (1 -> 25 bp) otherwise.
+        Pass an explicit list (e.g. ``np.linspace(0, 1, 21)``) to set the range.
     save_path:
         If given, the figure is also written to disk.
 
@@ -625,7 +630,6 @@ def plot_dashboard(
 
     if not results:
         raise ValueError("Nothing to plot.")
-    cost_levels = list(cost_levels) if cost_levels is not None else DEFAULT_COST_LEVELS
 
     fig, axes = plt.subplots(2, 3, figsize=figsize)
     ax_eq, ax_dd, ax_sharpe = axes[0]
@@ -635,6 +639,12 @@ def plot_dashboard(
     # sub-daily data we plot against a positional bar index instead.
     probe = next((res.returns for res in results if len(res.returns) > 2), None)
     intraday_x = probe is not None and infer_periods_per_year(probe.index) > 300
+
+    # Cost ladder: tight sub-1bp range for intraday, wider for daily.
+    if cost_levels is None:
+        cost_levels = DEFAULT_INTRADAY_COST_LEVELS if intraday_x else DEFAULT_COST_LEVELS
+    else:
+        cost_levels = list(cost_levels)
 
     def _xaxis(series: pd.Series):
         return np.arange(len(series)) if intraday_x else series.index
@@ -704,18 +714,18 @@ def plot_dashboard(
         ax_cost.set_xlabel("transaction cost (bps per bar)")
         ax_cost.set_ylabel(metric)
         ax_cost.legend(fontsize=7, ncol=2)
-        # Strategies can plunge to large negatives at high cost while the action
-        # of interest (the break-even crossing) sits near zero.  A symlog scale
-        # keeps the near-zero band linear and readable yet still shows the
-        # collapse, instead of one strategy squashing all the others.
+        # Use symlog only when a strategy plunges far below the others (wide
+        # range), so the near-zero break-even band stays readable.  For a tight
+        # range (e.g. the sub-1bp intraday ladder) keep a plain linear scale.
         if all_vals:
-            hi = max(all_vals)
-            linthresh = max(2.0, abs(hi))
-            ax_cost.set_yscale("symlog", linthresh=linthresh)
+            lo, hi = min(all_vals), max(all_vals)
+            if lo < -max(4.0, 3.0 * abs(hi)):
+                ax_cost.set_yscale("symlog", linthresh=max(2.0, abs(hi)))
     else:
         ax_cost.text(0.5, 0.5, "no gross/turnover stored\n(run via Backtester)",
                      ha="center", va="center", transform=ax_cost.transAxes)
-    ax_cost.set_title(f"{metric} degradation vs cost")
+    cost_lo, cost_hi = min(cost_levels), max(cost_levels)
+    ax_cost.set_title(f"{metric} vs cost  ({cost_lo:g}-{cost_hi:g} bps)")
     ax_cost.grid(alpha=0.3)
 
     # -- panel 6: risk / return map ---------------------------------------
@@ -789,6 +799,7 @@ def save_run(
     config: Optional[Dict[str, Any]] = None,
     save_returns: bool = True,
     latest: bool = True,
+    latest_label: Optional[str] = None,
 ) -> str:
     """Persist a batch of backtests so runs can be compared over time.
 
@@ -806,8 +817,10 @@ def save_run(
     performance drifts across data, costs or parameter changes.
 
     When ``latest`` is True (default) the same artifacts are also mirrored to a
-    stable ``<out_dir>/latest/`` folder, so a single, always-current copy can be
-    kept under version control without committing every timestamped run.
+    stable ``<out_dir>/latest/<latest_label>/`` folder (or ``<out_dir>/latest/``
+    when no label), so an always-current copy can be kept under version control
+    without committing every timestamped run.  Use distinct labels (e.g.
+    ``"daily"`` vs ``"intraday"``) to keep one snapshot per configuration.
 
     Returns
     -------
@@ -833,9 +846,11 @@ def save_run(
     }
 
     _write_run_artifacts(run_dir, results, meta, save_returns)
+    latest_dir = None
     if latest:
         import shutil
-        latest_dir = os.path.join(out_dir, "latest")
+        latest_dir = os.path.join(out_dir, "latest", latest_label) if latest_label \
+            else os.path.join(out_dir, "latest")
         if os.path.isdir(latest_dir):
             shutil.rmtree(latest_dir)
         _write_run_artifacts(latest_dir, results, meta, save_returns)
@@ -852,7 +867,7 @@ def save_run(
         log_path, mode="a", header=not os.path.exists(log_path), index=False
     )
     print(f"[save_run] wrote {run_dir}"
-          + (f" (+ {out_dir}/latest)" if latest else "")
+          + (f" (+ {latest_dir})" if latest_dir else "")
           + f"; appended {len(rows)} rows to {log_path}")
     return run_dir
 
@@ -1508,12 +1523,14 @@ class QuantLab:
         results: Sequence[BacktestResult],
         run_name: Optional[str] = None,
         out_dir: str = "results",
+        latest_label: Optional[str] = None,
     ) -> str:
         """Persist *results* with this lab's run config auto-captured.
 
-        Writes a timestamped run folder and appends to ``results/runs_log.csv``
-        so runs can be compared over time (see :func:`save_run`,
-        :func:`compare_runs`).
+        Writes a timestamped run folder, refreshes a ``latest/<label>`` snapshot
+        and appends to ``results/runs_log.csv`` so runs can be compared over time
+        (see :func:`save_run`, :func:`compare_runs`).  ``latest_label`` defaults
+        to ``"intraday"``/``"daily"`` so those snapshots are kept side by side.
         """
         config = {
             "frequency": self.frequency,
@@ -1525,7 +1542,12 @@ class QuantLab:
             "max_leverage": self.max_leverage,
             "n_assets": len(self.market.data),
         }
-        return save_run(results, out_dir=out_dir, run_name=run_name, config=config)
+        if latest_label is None:
+            latest_label = "intraday" if self.intraday else "daily"
+        return save_run(
+            results, out_dir=out_dir, run_name=run_name,
+            config=config, latest_label=latest_label,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - quick smoke run
