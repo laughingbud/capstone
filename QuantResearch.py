@@ -129,6 +129,43 @@ _RAW_COLUMN_MAP: Dict[str, str] = {
 _FILENAME_RE = re.compile(r"^(?P<ticker>.+)_(?P<contract>F\d+)\.csv$", re.IGNORECASE)
 
 
+def _parse_mixed_datetime(date_col: pd.Series, time_col: pd.Series) -> pd.Series:
+    """Parse the dataset's *inconsistent* date formats into a DatetimeIndex.
+
+    The vendor files mix conventions across months:
+
+    * most files use ``MM/DD/YYYY`` with slashes (e.g. ``03/31/2023``);
+    * the Aug-Dec 2023 files use ``DD-MM-YYYY`` with dashes (e.g. ``29-12-2023``).
+
+    Day-first vs month-first is detected *per file* from the data itself: a full
+    trading month always contains a day > 12, so whichever component exceeds 12
+    pins down the layout.  If that is inconclusive we fall back to whichever
+    interpretation yields fewer unparseable rows.  This avoids the silent
+    truncation/scrambling that a single hard-coded format caused.
+    """
+    date_str = date_col.astype(str).str.strip().str.replace("-", "/", regex=False)
+    combined = date_str + " " + time_col.astype(str).str.strip()
+
+    parts = date_str.str.split("/", expand=True)
+    first = pd.to_numeric(parts[0], errors="coerce")
+    second = pd.to_numeric(parts[1], errors="coerce")
+
+    if first.max() is not None and first.max() > 12:
+        dayfirst = True          # first component is a day -> DD/MM/YYYY
+    elif second.max() is not None and second.max() > 12:
+        dayfirst = False         # second component is a day -> MM/DD/YYYY
+    else:
+        dayfirst = None          # inconclusive (e.g. only days 1-12 present)
+
+    if dayfirst is None:
+        mdy = pd.to_datetime(combined, format="%m/%d/%Y %H:%M:%S", errors="coerce")
+        dmy = pd.to_datetime(combined, format="%d/%m/%Y %H:%M:%S", errors="coerce")
+        return dmy if dmy.isna().sum() < mdy.isna().sum() else mdy
+
+    fmt = "%d/%m/%Y %H:%M:%S" if dayfirst else "%m/%d/%Y %H:%M:%S"
+    return pd.to_datetime(combined, format=fmt, errors="coerce")
+
+
 class MarketData:
     """Index the on-disk CSV universe and load it as a tidy OHLCV+OI panel.
 
@@ -182,16 +219,10 @@ class MarketData:
     def _read_raw(path: str) -> pd.DataFrame:
         """Read one raw csv into a DatetimeIndexed OHLCV+OI frame."""
         df = pd.read_csv(path)
-        # Normalise the ``<open>`` style headers.
+        # Normalise the ``<open>`` / ``<o/i>`` / ``<OI>`` style headers.
         df.columns = [c.strip().strip("<>").strip().lower() for c in df.columns]
-        # Combine date (dd/mm/yyyy) + time into a single index.
-        dt = pd.to_datetime(
-            df["date"].astype(str).str.replace("-", "/", regex=False)
-            + " "
-            + df["time"].astype(str),
-            format="%d/%m/%Y %H:%M:%S",
-            errors="coerce",
-        )
+        # Date format varies by file (MM/DD/YYYY vs DD-MM-YYYY) -> detect per file.
+        dt = _parse_mixed_datetime(df["date"], df["time"])
         df = df.rename(columns=_RAW_COLUMN_MAP)
         keep = [c for c in ALL_FEATURES if c in df.columns]
         out = df[keep].copy()
