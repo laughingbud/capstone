@@ -579,6 +579,30 @@ def sharpe_vs_cost(
     return pd.Series(out, name=result.name)
 
 
+def cost_sensitivity_table(
+    results: Sequence[BacktestResult],
+    cost_levels: Optional[Sequence[float]] = None,
+    metric: str = "sharpe",
+) -> pd.DataFrame:
+    """``cost(bps) x strategy`` table of *metric* across a transaction-cost ladder.
+
+    When *cost_levels* is omitted the ladder defaults to the sub-1bp intraday
+    range for high-frequency data and the 1->25bp range otherwise (matching the
+    dashboard).  Strategies without stored gross/turnover are skipped.
+    """
+    if cost_levels is None:
+        probe = next((r.returns for r in results if r.returns is not None and len(r.returns) > 2), None)
+        intraday = probe is not None and infer_periods_per_year(probe.index) > 300
+        cost_levels = DEFAULT_INTRADAY_COST_LEVELS if intraday else DEFAULT_COST_LEVELS
+    cols = {r.name: sharpe_vs_cost(r, cost_levels, metric=metric) for r in results}
+    cols = {k: v for k, v in cols.items() if not v.empty}
+    if not cols:
+        return pd.DataFrame()
+    tbl = pd.DataFrame(cols)
+    tbl.index.name = "cost_bps"
+    return tbl
+
+
 def plot_dashboard(
     results: Sequence[BacktestResult],
     metric: str = "sharpe",
@@ -776,6 +800,10 @@ def _write_run_artifacts(
     if not asset_tbl.empty:
         asset_tbl.to_csv(os.path.join(target_dir, "asset_sharpe.csv"))
 
+    cost_tbl = cost_sensitivity_table(results)
+    if not cost_tbl.empty:
+        cost_tbl.to_csv(os.path.join(target_dir, "cost_sensitivity.csv"))
+
     if save_returns:
         nets = {r.name: r.returns for r in results if r.returns is not None}
         if nets:
@@ -805,12 +833,14 @@ def save_run(
 
     Creates ``<out_dir>/<run_id>/`` containing:
 
-    * ``metrics.csv``       -- the metric table (one row per strategy)
-    * ``asset_sharpe.csv``  -- ``asset x strategy`` Sharpe of each name's
+    * ``metrics.csv``          -- the metric table (one row per strategy)
+    * ``asset_sharpe.csv``     -- ``asset x strategy`` Sharpe of each name's
       contribution within each strategy
-    * ``returns.parquet``   -- wide ``time x strategy`` OOS net returns
+    * ``cost_sensitivity.csv`` -- ``cost(bps) x strategy`` Sharpe degradation
+      across the transaction-cost ladder
+    * ``returns.parquet``      -- wide ``time x strategy`` OOS net returns
       (and ``gross_returns.parquet`` when available, for cost re-analysis)
-    * ``meta.json``         -- run config + per-strategy chosen parameters
+    * ``meta.json``            -- run config + per-strategy chosen parameters
 
     and appends one row per strategy to the cumulative master log
     ``<out_dir>/runs_log.csv`` -- the file to read when tracking how a strategy's
