@@ -1,0 +1,164 @@
+{
+  "run_id": "20260617T205633Z_daily_fulluniv",
+  "created_utc": "20260617T205633Z",
+  "config": {
+    "frequency": "daily",
+    "contract": "F1",
+    "cost_bps": 1.0,
+    "target_vol": 0.15,
+    "intraday": false,
+    "vol_window": 20,
+    "max_leverage": 3.0,
+    "n_assets": 207
+  },
+  "strategies": {
+    "ts_momentum": {
+      "kind": "timeseries",
+      "chosen_params": [
+        {
+          "lookback": 10
+        },
+        {
+          "lookback": 60
+        },
+        {
+          "lookback": 60
+        },
+        {
+          "lookback": 60
+        }
+      ]
+    },
+    "ts_mean_reversion": {
+      "kind": "timeseries",
+      "chosen_params": [
+        {
+          "window": 40,
+          "z_entry": 1.5
+        },
+        {
+          "window": 40,
+          "z_entry": 1.5
+        },
+        {
+          "window": 40,
+          "z_entry": 1.5
+        },
+        {
+          "window": 40,
+          "z_entry": 1.5
+        }
+      ]
+    },
+    "ts_seasonality": {
+      "kind": "timeseries",
+      "chosen_params": [
+        {},
+        {},
+        {},
+        {}
+      ]
+    },
+    "ts_regime_adaptive": {
+      "kind": "timeseries",
+      "chosen_params": [
+        {
+          "lookback": 40,
+          "hurst_window": 60
+        },
+        {
+          "lookback": 10,
+          "hurst_window": 100
+        },
+        {
+          "lookback": 10,
+          "hurst_window": 100
+        },
+        {
+          "lookback": 10,
+          "hurst_window": 100
+        }
+      ]
+    },
+    "xs_momentum": {
+      "kind": "crosssectional",
+      "chosen_params": [
+        {
+          "lookback": 20,
+          "quantile": 0.3
+        },
+        {
+          "lookback": 20,
+          "quantile": 0.3
+        },
+        {
+          "lookback": 20,
+          "quantile": 0.3
+        },
+        {
+          "lookback": 20,
+          "quantile": 0.2
+        }
+      ]
+    },
+    "xs_mean_reversion": {
+      "kind": "crosssectional",
+      "chosen_params": [
+        {
+          "lookback": 5,
+          "quantile": 0.3
+        },
+        {
+          "lookback": 5,
+          "quantile": 0.3
+        },
+        {
+          "lookback": 10,
+          "quantile": 0.2
+        },
+        {
+          "lookback": 5,
+          "quantile": 0.3
+        }
+      ]
+    },
+    "xs_seasonality": {
+      "kind": "crosssectional",
+      "chosen_params": [
+        {
+          "quantile": 0.2
+        },
+        {
+          "quantile": 0.2
+        },
+        {
+          "quantile": 0.2
+        },
+        {
+          "quantile": 0.2
+        }
+      ]
+    },
+    "xs_residual_momentum": {
+      "kind": "crosssectional",
+      "chosen_params": [
+        {
+          "lookback": 40,
+          "quantile": 0.3
+        },
+        {
+          "lookback": 40,
+          "quantile": 0.2
+        },
+        {
+          "lookback": 20,
+          "quantile": 0.2
+        },
+        {
+          "lookback": 20,
+          "quantile": 0.2
+        }
+      ]
+    }
+  }
+}

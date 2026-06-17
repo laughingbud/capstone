@@ -2,8 +2,10 @@
 Data/.qr_cache/
 .qr_cache/
 
-# Saved backtest runs (artifacts; keep locally or commit selectively)
-results/
+# Saved backtest runs: ignore timestamped runs + master log, but keep the
+# always-current latest/ snapshot under version control for future reference.
+results/*
+!results/latest/
 
 # Python
 __pycache__/

@@ -488,6 +488,7 @@ class BacktestResult:
     meta: Dict[str, Any] = field(default_factory=dict)
     gross_returns: Optional[pd.Series] = None   # before transaction costs
     turnover: Optional[pd.Series] = None        # per-bar gross weight change
+    asset_returns: Optional[pd.DataFrame] = None  # time x asset NET contribution
 
     @property
     def equity_curve(self) -> pd.Series:
@@ -495,6 +496,22 @@ class BacktestResult:
 
     def summary(self) -> pd.Series:
         return pd.Series(self.metrics, name=self.name)
+
+    def asset_sharpe(self, periods_per_year: Optional[float] = None) -> pd.Series:
+        """Annualised Sharpe of each asset's net contribution to the strategy.
+
+        Shows which names actually drive (or drag) the strategy's P&L.  Assets
+        that never traded (all-zero contribution) are dropped.  Returns an empty
+        Series if per-asset contributions were not stored.
+        """
+        if self.asset_returns is None or self.asset_returns.empty:
+            return pd.Series(dtype=float, name=self.name)
+        ar = self.asset_returns
+        ppy = periods_per_year or infer_periods_per_year(ar.index)
+        active = ar.loc[:, (ar != 0).any(axis=0)]
+        std = active.std()
+        sharpe = active.mean() / std.replace(0, np.nan) * np.sqrt(ppy)
+        return sharpe.rename(self.name).sort_values(ascending=False)
 
     def net_returns_at_cost(self, cost_bps: float) -> pd.Series:
         """Recompute net returns at an arbitrary *cost_bps* (no re-run needed).
@@ -516,6 +533,19 @@ def report(results: Sequence[BacktestResult], sort_by: str = "sharpe") -> pd.Dat
     if sort_by in tbl.columns:
         tbl = tbl.sort_values(sort_by, ascending=False)
     return tbl
+
+
+def asset_sharpe_table(results: Sequence[BacktestResult]) -> pd.DataFrame:
+    """``asset x strategy`` table of each asset's Sharpe within each strategy.
+
+    Reveals which names drive or drag every strategy.  Assets a strategy never
+    traded show as NaN for that column.
+    """
+    cols = {res.name: res.asset_sharpe() for res in results}
+    cols = {k: v for k, v in cols.items() if not v.empty}
+    if not cols:
+        return pd.DataFrame()
+    return pd.DataFrame(cols).sort_index()
 
 
 #: Default transaction-cost ladder (basis points) for sensitivity analysis.
@@ -722,50 +752,72 @@ _RUN_CONFIG_KEYS = [
 ]
 
 
+def _write_run_artifacts(
+    target_dir: str,
+    results: Sequence[BacktestResult],
+    meta: Dict[str, Any],
+    save_returns: bool,
+) -> None:
+    """Write metrics/asset-Sharpe/returns/meta into *target_dir*."""
+    os.makedirs(target_dir, exist_ok=True)
+    report(results).to_csv(os.path.join(target_dir, "metrics.csv"))
+
+    asset_tbl = asset_sharpe_table(results)
+    if not asset_tbl.empty:
+        asset_tbl.to_csv(os.path.join(target_dir, "asset_sharpe.csv"))
+
+    if save_returns:
+        nets = {r.name: r.returns for r in results if r.returns is not None}
+        if nets:
+            pd.DataFrame(nets).sort_index().to_parquet(
+                os.path.join(target_dir, "returns.parquet")
+            )
+        gross = {r.name: r.gross_returns for r in results if r.gross_returns is not None}
+        if gross:
+            pd.DataFrame(gross).sort_index().to_parquet(
+                os.path.join(target_dir, "gross_returns.parquet")
+            )
+
+    with open(os.path.join(target_dir, "meta.json"), "w") as fh:
+        json.dump(meta, fh, indent=2, default=str)
+
+
 def save_run(
     results: Sequence[BacktestResult],
     out_dir: str = "results",
     run_name: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
     save_returns: bool = True,
+    latest: bool = True,
 ) -> str:
     """Persist a batch of backtests so runs can be compared over time.
 
     Creates ``<out_dir>/<run_id>/`` containing:
 
-    * ``metrics.csv``     -- the metric table (one row per strategy)
-    * ``returns.parquet`` -- wide ``time x strategy`` OOS net returns
+    * ``metrics.csv``       -- the metric table (one row per strategy)
+    * ``asset_sharpe.csv``  -- ``asset x strategy`` Sharpe of each name's
+      contribution within each strategy
+    * ``returns.parquet``   -- wide ``time x strategy`` OOS net returns
       (and ``gross_returns.parquet`` when available, for cost re-analysis)
-    * ``meta.json``       -- run config + per-strategy chosen parameters
+    * ``meta.json``         -- run config + per-strategy chosen parameters
 
     and appends one row per strategy to the cumulative master log
     ``<out_dir>/runs_log.csv`` -- the file to read when tracking how a strategy's
     performance drifts across data, costs or parameter changes.
 
+    When ``latest`` is True (default) the same artifacts are also mirrored to a
+    stable ``<out_dir>/latest/`` folder, so a single, always-current copy can be
+    kept under version control without committing every timestamped run.
+
     Returns
     -------
     str
-        The created run directory.
+        The created (timestamped) run directory.
     """
     config = dict(config or {})
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{ts}_{run_name}" if run_name else ts
     run_dir = os.path.join(out_dir, run_id)
-    os.makedirs(run_dir, exist_ok=True)
-
-    report(results).to_csv(os.path.join(run_dir, "metrics.csv"))
-
-    if save_returns:
-        nets = {r.name: r.returns for r in results if r.returns is not None}
-        if nets:
-            pd.DataFrame(nets).sort_index().to_parquet(
-                os.path.join(run_dir, "returns.parquet")
-            )
-        gross = {r.name: r.gross_returns for r in results if r.gross_returns is not None}
-        if gross:
-            pd.DataFrame(gross).sort_index().to_parquet(
-                os.path.join(run_dir, "gross_returns.parquet")
-            )
 
     meta = {
         "run_id": run_id,
@@ -779,8 +831,14 @@ def save_run(
             for r in results
         },
     }
-    with open(os.path.join(run_dir, "meta.json"), "w") as fh:
-        json.dump(meta, fh, indent=2, default=str)
+
+    _write_run_artifacts(run_dir, results, meta, save_returns)
+    if latest:
+        import shutil
+        latest_dir = os.path.join(out_dir, "latest")
+        if os.path.isdir(latest_dir):
+            shutil.rmtree(latest_dir)
+        _write_run_artifacts(latest_dir, results, meta, save_returns)
 
     # Append to the cumulative master log (long format: one row per strategy).
     rows = []
@@ -793,7 +851,9 @@ def save_run(
     pd.DataFrame(rows).to_csv(
         log_path, mode="a", header=not os.path.exists(log_path), index=False
     )
-    print(f"[save_run] wrote {run_dir}; appended {len(rows)} rows to {log_path}")
+    print(f"[save_run] wrote {run_dir}"
+          + (f" (+ {out_dir}/latest)" if latest else "")
+          + f"; appended {len(rows)} rows to {log_path}")
     return run_dir
 
 
@@ -1149,7 +1209,13 @@ class Backtester:
         w.loc[is_last_of_day.values] = 0.0
         return w
 
-    def run(self, strategy: Strategy, close: pd.DataFrame, name: Optional[str] = None) -> BacktestResult:
+    def run(
+        self,
+        strategy: Strategy,
+        close: pd.DataFrame,
+        name: Optional[str] = None,
+        with_assets: bool = True,
+    ) -> BacktestResult:
         raw_weights = strategy.generate_weights(close).reindex(close.index)
         asset_rets = close.pct_change().reindex(close.index)
 
@@ -1164,12 +1230,19 @@ class Backtester:
 
         # Lag weights by one bar: decide on bar t, earn return over t -> t+1.
         lagged = weights.shift(1).fillna(0.0)
-        gross = (lagged * asset_rets).sum(axis=1)
-        # Transaction costs on turnover (includes the EOD flatten / next-open re-entry).
-        turnover = (weights - weights.shift(1)).abs().sum(axis=1).fillna(0.0)
+        weight_chg = (weights - weights.shift(1)).abs()
+        # Per-asset gross P&L and per-asset cost; summing over assets gives the
+        # portfolio series, so the decomposition is exact.
+        asset_gross = lagged * asset_rets
+        gross = asset_gross.sum(axis=1)
+        turnover = weight_chg.sum(axis=1).fillna(0.0)
         net = (gross - turnover * (self.cost_bps / 1e4)).fillna(0.0)
-        # Drop the first bar (no prior weight) and align gross/turnover to net.
+        # Drop the first bar (no prior weight) and align series to net.
         gross, turnover, net = gross.iloc[1:], turnover.iloc[1:], net.iloc[1:]
+
+        asset_net = None
+        if with_assets:
+            asset_net = (asset_gross - weight_chg * (self.cost_bps / 1e4)).iloc[1:]
 
         meta = {"params": dict(strategy.params), "kind": strategy.kind,
                 "intraday": self.intraday}
@@ -1184,6 +1257,7 @@ class Backtester:
             meta=meta,
             gross_returns=gross,
             turnover=turnover,
+            asset_returns=asset_net,
         )
         return res
 
@@ -1261,6 +1335,7 @@ class WalkForwardValidator:
         oos_returns: List[pd.Series] = []
         oos_gross: List[pd.Series] = []
         oos_turnover: List[pd.Series] = []
+        oos_assets: List[pd.DataFrame] = []
         chosen: List[Dict[str, Any]] = []
 
         for i in range(self.n_splits):
@@ -1277,7 +1352,8 @@ class WalkForwardValidator:
             best_score, best_params = -np.inf, combos[0]
             for params in combos:
                 strat = strategy_cls(**params)
-                is_res = self.backtester.run(strat, is_slice)
+                # Per-asset breakdown not needed while scoring candidates.
+                is_res = self.backtester.run(strat, is_slice, with_assets=False)
                 score = is_res.metrics.get(self.scoring, np.nan)
                 if np.isfinite(score) and score > best_score:
                     best_score, best_params = score, params
@@ -1290,6 +1366,8 @@ class WalkForwardValidator:
             if oos_res.gross_returns is not None:
                 oos_gross.append(oos_res.gross_returns.loc[oos_res.gross_returns.index >= cutoff])
                 oos_turnover.append(oos_res.turnover.loc[oos_res.turnover.index >= cutoff])
+            if oos_res.asset_returns is not None:
+                oos_assets.append(oos_res.asset_returns.loc[oos_res.asset_returns.index >= cutoff])
             chosen.append(best_params)
 
         def _stitch(parts: List[pd.Series]) -> Optional[pd.Series]:
@@ -1297,6 +1375,12 @@ class WalkForwardValidator:
                 return None
             s = pd.concat(parts).sort_index()
             return s[~s.index.duplicated(keep="first")]
+
+        def _stitch_df(parts: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
+            if not parts:
+                return None
+            df = pd.concat(parts).sort_index()
+            return df[~df.index.duplicated(keep="first")]
 
         stitched = _stitch(oos_returns)
         return BacktestResult(
@@ -1312,6 +1396,7 @@ class WalkForwardValidator:
             },
             gross_returns=_stitch(oos_gross),
             turnover=_stitch(oos_turnover),
+            asset_returns=_stitch_df(oos_assets),
         )
 
 
