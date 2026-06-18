@@ -1,13 +1,13 @@
 {
-  "run_id": "20260617T215337Z_intraday_idx_50eq",
-  "created_utc": "20260617T215337Z",
+  "run_id": "20260618T054713Z_intraday_idx_50eq",
+  "created_utc": "20260618T054713Z",
   "config": {
     "frequency": "minutely",
     "contract": "F1",
     "cost_bps": 0.5,
-    "target_vol": null,
+    "target_vol": 0.15,
     "intraday": true,
-    "vol_window": 20,
+    "vol_window": 390,
     "max_leverage": 3.0,
     "n_assets": 54
   },
@@ -51,15 +51,15 @@
       "chosen_params": [
         {
           "window": 40,
-          "z_entry": 1.5
+          "z_entry": 2.0
         },
         {
           "window": 40,
-          "z_entry": 1.5
+          "z_entry": 2.0
         },
         {
           "window": 40,
-          "z_entry": 1.5
+          "z_entry": 2.0
         },
         {
           "window": 40,
@@ -76,7 +76,7 @@
         },
         {
           "window": 10,
-          "z_entry": 1.5
+          "z_entry": 1.0
         },
         {
           "window": 10,
@@ -124,27 +124,6 @@
         {
           "lookback": 40,
           "hurst_window": 100
-        }
-      ]
-    },
-    "ts_regime_adaptive_ss": {
-      "kind": "timeseries",
-      "chosen_params": [
-        {
-          "lookback": 10,
-          "hurst_window": 60
-        },
-        {
-          "lookback": 10,
-          "hurst_window": 60
-        },
-        {
-          "lookback": 10,
-          "hurst_window": 60
-        },
-        {
-          "lookback": 10,
-          "hurst_window": 60
         }
       ]
     },

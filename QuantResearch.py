@@ -1556,17 +1556,31 @@ class QuantLab:
         return self.run_strategy(name, **kw)
 
     # -- batches -----------------------------------------------------------
-    def run_all(self, walk_forward: bool = True) -> List[BacktestResult]:
+    #: (strategy, universe) combos skipped by run_all by default.  The Hurst
+    #: regime model on every single name is very slow and not worth it, so
+    #: ts_regime_adaptive on equities (``ts_regime_adaptive_ss``) is off by
+    #: default; pass ``skip=set()`` to run everything.
+    DEFAULT_SKIP = frozenset({("ts_regime_adaptive", "equity")})
+
+    def run_all(
+        self,
+        walk_forward: bool = True,
+        skip: Optional[Iterable[Tuple[str, str]]] = None,
+    ) -> List[BacktestResult]:
         """Run every strategy on its relevant universe(s).
 
         Time-series strategies are run on *both* the index and single-name
         universes (``*_index`` / ``*_ss``); cross-sectional strategies on the
-        single-name universe.
+        single-name universe.  *skip* is a set of ``(strategy_name, universe)``
+        pairs to omit; it defaults to :data:`DEFAULT_SKIP`.
         """
+        skip = self.DEFAULT_SKIP if skip is None else set(skip)
         results = []
         for name, cls in STRATEGIES.items():
             universes = ("index", "equity") if cls.kind == "timeseries" else ("equity",)
             for uni in universes:
+                if (name, uni) in skip:
+                    continue
                 try:
                     results.append(
                         self.run_strategy(name, walk_forward=walk_forward, universe=uni)

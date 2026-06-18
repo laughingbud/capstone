@@ -1,6 +1,6 @@
 {
-  "run_id": "20260617T212924Z_daily_fulluniv",
-  "created_utc": "20260617T212924Z",
+  "run_id": "20260618T054430Z_daily_fulluniv",
+  "created_utc": "20260618T054430Z",
   "config": {
     "frequency": "daily",
     "contract": "F1",
@@ -112,27 +112,6 @@
         {
           "lookback": 40,
           "hurst_window": 60
-        },
-        {
-          "lookback": 10,
-          "hurst_window": 100
-        },
-        {
-          "lookback": 10,
-          "hurst_window": 100
-        },
-        {
-          "lookback": 10,
-          "hurst_window": 100
-        }
-      ]
-    },
-    "ts_regime_adaptive_ss": {
-      "kind": "timeseries",
-      "chosen_params": [
-        {
-          "lookback": 10,
-          "hurst_window": 100
         },
         {
           "lookback": 10,
