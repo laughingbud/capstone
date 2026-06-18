@@ -479,7 +479,7 @@ _METRIC_KEYS = [
 #: Execution / implementation columns appended after the return metrics.
 _EXEC_KEYS = [
     "gross_leverage", "turnover_per_bar", "ann_turnover",
-    "tcost_bps", "cost_drag_ann",
+    "tcost_bps", "realized_cost_bps", "cost_drag_ann",
 ]
 
 
@@ -492,9 +492,11 @@ def execution_stats(result: "BacktestResult") -> Dict[str, float]:
         gross_leverage    : average book size, mean of sum(|weights|)
         turnover_per_bar  : mean of sum(|dweight|) per bar (both sides)
         ann_turnover      : turnover_per_bar annualised (book turns / year)
-        tcost_bps         : the per-bar transaction-cost assumption used
-        cost_drag_ann     : annualised return given up to costs
-                            (turnover_per_bar * tcost_bps/1e4 * periods/year)
+        tcost_bps         : the assumed spread/linear cost (bps)
+        realized_cost_bps : effective cost actually paid per unit turnover,
+                            incl. market impact -- derived from gross vs net
+        cost_drag_ann     : annualised return actually given up to costs
+                            (gross minus net), so impact is captured
     """
     out = {k: np.nan for k in _EXEC_KEYS}
     out["tcost_bps"] = result.meta.get("tcost_bps", np.nan)
@@ -502,15 +504,24 @@ def execution_stats(result: "BacktestResult") -> Dict[str, float]:
     ref = result.returns
     ppy = infer_periods_per_year(ref.index) if ref is not None and len(ref) > 2 else 252.0
 
+    tpb = np.nan
     if result.turnover is not None and len(result.turnover):
         tpb = float(result.turnover.mean())
         out["turnover_per_bar"] = tpb
         out["ann_turnover"] = tpb * ppy
-        tc = out["tcost_bps"]
-        if tc is not None and np.isfinite(tc):
-            out["cost_drag_ann"] = tpb * (tc / 1e4) * ppy
     if result.gross_exposure is not None and len(result.gross_exposure):
         out["gross_leverage"] = float(result.gross_exposure.mean())
+
+    # Realised cost straight from gross vs net -> captures impact, not just the
+    # assumed spread.  Falls back to the linear assumption if gross is absent.
+    if result.gross_returns is not None and result.returns is not None \
+            and len(result.gross_returns) == len(result.returns):
+        drag_per_bar = float(result.gross_returns.mean() - result.returns.mean())
+        out["cost_drag_ann"] = drag_per_bar * ppy
+        if np.isfinite(tpb) and tpb > 0:
+            out["realized_cost_bps"] = drag_per_bar / tpb * 1e4
+    elif np.isfinite(tpb) and np.isfinite(out["tcost_bps"]):
+        out["cost_drag_ann"] = tpb * (out["tcost_bps"] / 1e4) * ppy
     return out
 
 
@@ -826,6 +837,8 @@ def plot_dashboard(
 _RUN_CONFIG_KEYS = [
     "frequency", "contract", "cost_bps", "target_vol", "intraday",
     "vol_window", "max_leverage", "n_assets",
+    "signal_smooth", "rebalance_every", "no_trade_band", "turnover_penalty",
+    "impact_coef_bps", "capital",
 ]
 
 
@@ -1235,6 +1248,48 @@ DEFAULT_PARAM_GRIDS: Dict[str, Dict[str, List[Any]]] = {
 # ---------------------------------------------------------------------------
 # 5. Backtesting & walk-forward validation
 # ---------------------------------------------------------------------------
+@dataclass
+class CostModel:
+    """Transaction-cost model: linear spread/slippage + square-root impact.
+
+    Per-asset cost (in return units) for trading ``|dw|`` of the book is::
+
+        cost = |dw| * (spread_bps + impact_coef_bps * sqrt(participation)) / 1e4
+        participation = |dw| * capital / ADV_value
+
+    The linear ``spread_bps`` term is the half-spread + fixed slippage you always
+    pay.  The square-root term is market impact: it grows with how large the
+    trade is relative to the asset's average daily traded value (``adv``), so big
+    trades in thin names are penalised -- the classic Almgren-style impact curve.
+    With ``impact_coef_bps == 0`` (or no ``adv``) it reduces to the old linear
+    model, preserving prior behaviour.
+
+    Parameters
+    ----------
+    spread_bps:        linear cost per unit turnover (bps).
+    impact_coef_bps:   impact cost (bps) at 100% participation of one bar's ADV.
+    capital:           notional capital deployed, in the data's price*volume units.
+    adv:               per-asset average daily traded value; index = ticker.
+    """
+
+    spread_bps: float = 1.0
+    impact_coef_bps: float = 0.0
+    capital: float = 1e7
+    adv: Optional[pd.Series] = None
+
+    def per_asset_cost(self, weight_chg: pd.DataFrame) -> pd.DataFrame:
+        cost = weight_chg * (self.spread_bps / 1e4)
+        if self.impact_coef_bps and self.adv is not None:
+            adv = self.adv.reindex(weight_chg.columns)
+            adv = adv.where(adv > 0)
+            participation = (weight_chg * self.capital).div(adv, axis=1)
+            impact_bps = self.impact_coef_bps * np.sqrt(
+                participation.clip(lower=0).fillna(0.0)
+            )
+            cost = cost + weight_chg * (impact_bps / 1e4)
+        return cost
+
+
 class Backtester:
     """Vectorised, look-ahead-safe backtester.
 
@@ -1282,6 +1337,7 @@ class Backtester:
         signal_smooth: Optional[int] = None,
         rebalance_every: int = 1,
         no_trade_band: Optional[float] = None,
+        cost_model: Optional[CostModel] = None,
     ) -> None:
         self.cost_bps = cost_bps
         self.target_vol = target_vol
@@ -1292,6 +1348,8 @@ class Backtester:
         self.signal_smooth = signal_smooth      # #3 EMA span applied to weights
         self.rebalance_every = rebalance_every  # #2 act every N bars
         self.no_trade_band = no_trade_band      # #1 rel. deviation band to trade
+        # Full cost model (spread + impact); falls back to linear cost_bps.
+        self.cost_model = cost_model
 
     def _vol_target_weights(
         self, weights: pd.DataFrame, asset_rets: pd.DataFrame
@@ -1391,17 +1449,22 @@ class Backtester:
         gross = asset_gross.sum(axis=1)
         turnover = weight_chg.sum(axis=1).fillna(0.0)
         gross_exposure = weights.abs().sum(axis=1)        # book size / leverage
-        net = (gross - turnover * (self.cost_bps / 1e4)).fillna(0.0)
+        # Transaction cost: spread + (optional) square-root market impact.
+        cost_model = self.cost_model or CostModel(spread_bps=self.cost_bps)
+        asset_cost = cost_model.per_asset_cost(weight_chg)
+        cost = asset_cost.sum(axis=1)
+        net = (gross - cost).fillna(0.0)
         # Drop the first bar (no prior weight) and align series to net.
         gross, turnover, net = gross.iloc[1:], turnover.iloc[1:], net.iloc[1:]
         gross_exposure = gross_exposure.iloc[1:]
 
         asset_net = None
         if with_assets:
-            asset_net = (asset_gross - weight_chg * (self.cost_bps / 1e4)).iloc[1:]
+            asset_net = (asset_gross - asset_cost).iloc[1:]
 
         meta = {"params": dict(strategy.params), "kind": strategy.kind,
-                "intraday": self.intraday, "tcost_bps": self.cost_bps}
+                "intraday": self.intraday, "tcost_bps": cost_model.spread_bps,
+                "impact_coef_bps": cost_model.impact_coef_bps}
         if leverage is not None:
             meta["target_vol"] = self.target_vol
             meta["avg_leverage"] = float(leverage.replace(0.0, np.nan).mean())
@@ -1460,6 +1523,7 @@ class WalkForwardValidator:
         rebalance_every: int = 1,
         no_trade_band: Optional[float] = None,
         turnover_penalty: float = 0.0,
+        cost_model: Optional[CostModel] = None,
     ) -> None:
         self.n_splits = n_splits
         self.train_span = train_span
@@ -1475,6 +1539,7 @@ class WalkForwardValidator:
             signal_smooth=signal_smooth,
             rebalance_every=rebalance_every,
             no_trade_band=no_trade_band,
+            cost_model=cost_model,
         )
 
     @staticmethod
@@ -1568,7 +1633,11 @@ class WalkForwardValidator:
                 "chosen_params": chosen,
                 "kind": strategy_cls.kind,
                 "intraday": self.backtester.intraday,
-                "tcost_bps": self.backtester.cost_bps,
+                "tcost_bps": (self.backtester.cost_model.spread_bps
+                              if self.backtester.cost_model
+                              else self.backtester.cost_bps),
+                "impact_coef_bps": (self.backtester.cost_model.impact_coef_bps
+                                    if self.backtester.cost_model else 0.0),
             },
             gross_returns=_stitch(oos_gross),
             turnover=_stitch(oos_turnover),
@@ -1603,6 +1672,8 @@ class QuantLab:
         rebalance_every: int = 1,
         no_trade_band: Optional[float] = None,
         turnover_penalty: float = 0.0,
+        impact_coef_bps: float = 0.0,
+        capital: float = 1e7,
     ) -> None:
         self.market = MarketData(data_dir, cache_dir=cache_dir)
         self.classifier = TickerClassifier
@@ -1616,14 +1687,17 @@ class QuantLab:
         self.rebalance_every = rebalance_every
         self.no_trade_band = no_trade_band
         self.turnover_penalty = turnover_penalty
+        # Square-root market-impact model (off when impact_coef_bps == 0).
+        self.impact_coef_bps = impact_coef_bps
+        self.capital = capital
+        self.contract = "F1"
+        self.frequency = "daily"
         self.backtester = Backtester(
             cost_bps=cost_bps, target_vol=target_vol,
             vol_window=vol_window, max_leverage=max_leverage, intraday=intraday,
             signal_smooth=signal_smooth, rebalance_every=rebalance_every,
             no_trade_band=no_trade_band,
         )
-        self.contract = "F1"
-        self.frequency = "daily"
 
     # -- data --------------------------------------------------------------
     def load(
@@ -1651,6 +1725,31 @@ class QuantLab:
         idx_cols, eq_cols = self.classifier.split(close.columns)
         cols = idx_cols if universe == "index" else eq_cols
         return close[cols].dropna(how="all")
+
+    def _adv_value(self, cols: Sequence[str]) -> pd.Series:
+        """Average daily traded value per ticker (price*volume), for impact."""
+        advs = {}
+        for t in cols:
+            df = self.market.data.get(t)
+            if df is None or "Volume" not in df or "Close" not in df:
+                continue
+            value = (df["Volume"] * df["Close"]).dropna()
+            if value.empty:
+                continue
+            daily = value.groupby(value.index.normalize()).sum()
+            advs[t] = float(daily.mean())
+        return pd.Series(advs, dtype=float)
+
+    def _cost_model(self, cols: Sequence[str]) -> Optional[CostModel]:
+        """Build the CostModel for a universe (None -> linear cost only)."""
+        if not self.impact_coef_bps:
+            return None
+        return CostModel(
+            spread_bps=self.cost_bps,
+            impact_coef_bps=self.impact_coef_bps,
+            capital=self.capital,
+            adv=self._adv_value(cols),
+        )
 
     # -- single strategy ---------------------------------------------------
     def run_strategy(
@@ -1682,6 +1781,8 @@ class QuantLab:
         if cls.kind == "timeseries":
             result_name = f"{name}_{self._UNIVERSE_SUFFIX[universe]}"
 
+        cost_model = self._cost_model(close.columns)
+
         if walk_forward:
             grid = {k: [v] for k, v in params.items()} if params else None
             validator = WalkForwardValidator(
@@ -1691,9 +1792,17 @@ class QuantLab:
                 rebalance_every=self.rebalance_every,
                 no_trade_band=self.no_trade_band,
                 turnover_penalty=self.turnover_penalty,
+                cost_model=cost_model,
             )
             return validator.run(cls, close, grid, name=result_name)
-        return self.backtester.run(cls(**params), close, name=result_name)
+        bt = Backtester(
+            cost_bps=self.cost_bps, target_vol=self.target_vol,
+            vol_window=self.vol_window, max_leverage=self.max_leverage,
+            intraday=self.intraday, signal_smooth=self.signal_smooth,
+            rebalance_every=self.rebalance_every, no_trade_band=self.no_trade_band,
+            cost_model=cost_model,
+        )
+        return bt.run(cls(**params), close, name=result_name)
 
     def run_timeseries(self, name: str = "ts_momentum", universe: str = "index", **kw: Any) -> BacktestResult:
         return self.run_strategy(name, universe=universe, **kw)
@@ -1767,6 +1876,12 @@ class QuantLab:
             "vol_window": self.vol_window,
             "max_leverage": self.max_leverage,
             "n_assets": len(self.market.data),
+            "signal_smooth": self.signal_smooth,
+            "rebalance_every": self.rebalance_every,
+            "no_trade_band": self.no_trade_band,
+            "turnover_penalty": self.turnover_penalty,
+            "impact_coef_bps": self.impact_coef_bps,
+            "capital": self.capital,
         }
         if latest_label is None:
             latest_label = "intraday" if self.intraday else "daily"
