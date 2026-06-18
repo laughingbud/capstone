@@ -830,6 +830,46 @@ def plot_dashboard(
     return fig
 
 
+def plot_capacity_frontier(
+    frontiers: Dict[str, pd.DataFrame],
+    metric: str = "sharpe",
+    figsize: Tuple[float, float] = (10, 6),
+    title: Optional[str] = None,
+    save_path: Optional[str] = None,
+):
+    """Plot impact-aware *metric* vs book size for one or more frontier sweeps.
+
+    ``frontiers`` maps a label (e.g. ``"5-min"``) to the DataFrame returned by
+    :meth:`QuantLab.capacity_frontier`.  Each curve's Sharpe=0 capacity
+    (``df.attrs['frontier_capital']``) is marked with a dashed line.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=figsize)
+    cmap = plt.get_cmap("tab10")
+    for i, (label, df) in enumerate(frontiers.items()):
+        color = cmap(i % 10)
+        ax.plot(df["capital"], df[metric], marker="o", color=color, label=label, lw=1.6)
+        fc = df.attrs.get("frontier_capital", np.nan)
+        if np.isfinite(fc):
+            ax.axvline(fc, color=color, ls="--", alpha=0.6)
+            ax.annotate(f"{label} capacity\n{fc:,.0f}", xy=(fc, 0),
+                        xytext=(6, 12 + 14 * i), textcoords="offset points",
+                        fontsize=8, color=color)
+    ax.set_xscale("log")
+    ax.axhline(0.0, color="grey", lw=1.0)
+    ax.set_xlabel("book size (currency, log scale)")
+    ax.set_ylabel(f"impact-aware {metric}")
+    ax.set_title(title or "Capacity frontier: Sharpe vs book size")
+    ax.legend()
+    ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=120, bbox_inches="tight")
+        print(f"[plot_capacity_frontier] saved to {save_path}")
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # 3b. Results persistence (track & compare runs over time)
 # ---------------------------------------------------------------------------
