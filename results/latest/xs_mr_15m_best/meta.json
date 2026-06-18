@@ -1,0 +1,44 @@
+{
+  "run_id": "20260618T083633Z_xs_mr_15m_best",
+  "created_utc": "20260618T083633Z",
+  "config": {
+    "frequency": "15min",
+    "contract": "F1",
+    "cost_bps": 0.5,
+    "target_vol": 0.15,
+    "intraday": true,
+    "vol_window": 26,
+    "max_leverage": 3.0,
+    "n_assets": 203,
+    "signal_smooth": null,
+    "rebalance_every": 1,
+    "no_trade_band": null,
+    "turnover_penalty": 0.0,
+    "impact_coef_bps": 15.0,
+    "capital": 50000000.0,
+    "liquidity_power": -0.5
+  },
+  "strategies": {
+    "xs_mean_reversion": {
+      "kind": "crosssectional",
+      "chosen_params": [
+        {
+          "lookback": 5,
+          "quantile": 0.3
+        },
+        {
+          "lookback": 5,
+          "quantile": 0.2
+        },
+        {
+          "lookback": 5,
+          "quantile": 0.2
+        },
+        {
+          "lookback": 5,
+          "quantile": 0.2
+        }
+      ]
+    }
+  }
+}
