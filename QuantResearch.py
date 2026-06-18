@@ -1751,12 +1751,24 @@ class QuantLab:
             adv=self._adv_value(cols),
         )
 
+    def liquid_equities(self, n: int) -> List[str]:
+        """Top *n* equity tickers by average daily traded value (most liquid).
+
+        Requires data to be loaded; ranks on ADV (price*volume) of the loaded
+        bars.  Useful to restrict a cross-sectional strategy to names where
+        market impact is lowest.
+        """
+        _, eq = self.classifier.split(list(self.market.data))
+        adv = self._adv_value(eq).dropna().sort_values(ascending=False)
+        return adv.head(n).index.tolist()
+
     # -- single strategy ---------------------------------------------------
     def run_strategy(
         self,
         name: str,
         walk_forward: bool = True,
         universe: Optional[str] = None,
+        tickers: Optional[Sequence[str]] = None,
         **params: Any,
     ) -> BacktestResult:
         """Run one strategy.
@@ -1767,6 +1779,9 @@ class QuantLab:
         pointed at the single-name universe -- in which case each stock is traded
         independently on its own signal and the result is suffixed ``_ss`` (vs
         ``_index``), e.g. ``ts_momentum_ss``.
+
+        ``tickers`` optionally restricts the universe to a subset (e.g. the most
+        liquid names from :meth:`liquid_equities`).
         """
         if name not in STRATEGIES:
             raise KeyError(f"Unknown strategy {name!r}; choose from {list(STRATEGIES)}")
@@ -1776,6 +1791,9 @@ class QuantLab:
         else:
             universe = universe or "index"
         close = self._universe_panel(universe)
+        if tickers is not None:
+            keep = [c for c in close.columns if c in set(tickers)]
+            close = close[keep]
 
         result_name = name
         if cls.kind == "timeseries":
