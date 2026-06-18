@@ -1500,18 +1500,45 @@ class QuantLab:
             use_cache=use_cache, rebuild_cache=rebuild_cache,
         )
 
-    def _close_panel(self, kind: str) -> pd.DataFrame:
+    #: Suffix appended to a result name to flag which universe it ran on.
+    _UNIVERSE_SUFFIX = {"index": "index", "equity": "ss"}  # ss = single-stock
+
+    def _universe_panel(self, universe: str) -> pd.DataFrame:
         close = self.market.panel("Close")
         idx_cols, eq_cols = self.classifier.split(close.columns)
-        sub = close[idx_cols] if kind == "timeseries" else close[eq_cols]
-        return sub.dropna(how="all")
+        cols = idx_cols if universe == "index" else eq_cols
+        return close[cols].dropna(how="all")
 
     # -- single strategy ---------------------------------------------------
-    def run_strategy(self, name: str, walk_forward: bool = True, **params: Any) -> BacktestResult:
+    def run_strategy(
+        self,
+        name: str,
+        walk_forward: bool = True,
+        universe: Optional[str] = None,
+        **params: Any,
+    ) -> BacktestResult:
+        """Run one strategy.
+
+        ``universe`` selects the asset set: ``"index"`` (the 4 index futures) or
+        ``"equity"`` (single-name stocks).  Cross-sectional strategies are always
+        run on equities.  Time-series strategies default to indices but can be
+        pointed at the single-name universe -- in which case each stock is traded
+        independently on its own signal and the result is suffixed ``_ss`` (vs
+        ``_index``), e.g. ``ts_momentum_ss``.
+        """
         if name not in STRATEGIES:
             raise KeyError(f"Unknown strategy {name!r}; choose from {list(STRATEGIES)}")
         cls = STRATEGIES[name]
-        close = self._close_panel(cls.kind)
+        if cls.kind == "crosssectional":
+            universe = "equity"
+        else:
+            universe = universe or "index"
+        close = self._universe_panel(universe)
+
+        result_name = name
+        if cls.kind == "timeseries":
+            result_name = f"{name}_{self._UNIVERSE_SUFFIX[universe]}"
+
         if walk_forward:
             grid = {k: [v] for k, v in params.items()} if params else None
             validator = WalkForwardValidator(
@@ -1519,24 +1546,33 @@ class QuantLab:
                 vol_window=self.vol_window, max_leverage=self.max_leverage,
                 intraday=self.intraday,
             )
-            return validator.run(cls, close, grid, name=name)
-        return self.backtester.run(cls(**params), close, name=name)
+            return validator.run(cls, close, grid, name=result_name)
+        return self.backtester.run(cls(**params), close, name=result_name)
 
-    def run_timeseries(self, name: str = "ts_momentum", **kw: Any) -> BacktestResult:
-        return self.run_strategy(name, **kw)
+    def run_timeseries(self, name: str = "ts_momentum", universe: str = "index", **kw: Any) -> BacktestResult:
+        return self.run_strategy(name, universe=universe, **kw)
 
     def run_crosssectional(self, name: str = "xs_momentum", **kw: Any) -> BacktestResult:
         return self.run_strategy(name, **kw)
 
     # -- batches -----------------------------------------------------------
     def run_all(self, walk_forward: bool = True) -> List[BacktestResult]:
-        """Run every registered strategy on its appropriate universe."""
+        """Run every strategy on its relevant universe(s).
+
+        Time-series strategies are run on *both* the index and single-name
+        universes (``*_index`` / ``*_ss``); cross-sectional strategies on the
+        single-name universe.
+        """
         results = []
-        for name in STRATEGIES:
-            try:
-                results.append(self.run_strategy(name, walk_forward=walk_forward))
-            except Exception as exc:                       # keep the batch going
-                print(f"[QuantLab] {name} failed: {exc}")
+        for name, cls in STRATEGIES.items():
+            universes = ("index", "equity") if cls.kind == "timeseries" else ("equity",)
+            for uni in universes:
+                try:
+                    results.append(
+                        self.run_strategy(name, walk_forward=walk_forward, universe=uni)
+                    )
+                except Exception as exc:                   # keep the batch going
+                    print(f"[QuantLab] {name} ({uni}) failed: {exc}")
         return results
 
     @staticmethod
