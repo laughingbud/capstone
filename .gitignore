@@ -11,5 +11,10 @@ results/*
 __pycache__/
 *.pyc
 
+# Node (docx report generator deps)
+node_modules/
+package.json
+package-lock.json
+
 # macOS
 .DS_Store
