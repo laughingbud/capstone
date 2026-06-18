@@ -1260,6 +1260,16 @@ class Backtester:
         the weight on the last bar of each session is set to zero, so the
         overnight close->open gap return is never earned and no position is
         carried overnight.  This is the right mode for minute-level strategies.
+    signal_smooth:
+        Turnover control #3.  EMA span (in bars) applied to the target weights
+        so positions move gradually instead of flipping.  ``None`` = off.
+    rebalance_every:
+        Turnover control #2.  Rebalance only every N bars, holding the target
+        in between.  ``1`` (default) = rebalance every bar.
+    no_trade_band:
+        Turnover control #1.  Hysteresis band: only trade a name when its target
+        weight drifts more than this *fraction* from the held weight (e.g.
+        ``0.25`` = trade on a 25% deviation).  ``None`` = off.
     """
 
     def __init__(
@@ -1269,12 +1279,19 @@ class Backtester:
         vol_window: int = 20,
         max_leverage: float = 3.0,
         intraday: bool = False,
+        signal_smooth: Optional[int] = None,
+        rebalance_every: int = 1,
+        no_trade_band: Optional[float] = None,
     ) -> None:
         self.cost_bps = cost_bps
         self.target_vol = target_vol
         self.vol_window = vol_window
         self.max_leverage = max_leverage
         self.intraday = intraday
+        # --- turnover controls (all default to "off" = original behaviour) ---
+        self.signal_smooth = signal_smooth      # #3 EMA span applied to weights
+        self.rebalance_every = rebalance_every  # #2 act every N bars
+        self.no_trade_band = no_trade_band      # #1 rel. deviation band to trade
 
     def _vol_target_weights(
         self, weights: pd.DataFrame, asset_rets: pd.DataFrame
@@ -1290,13 +1307,48 @@ class Backtester:
         return weights.mul(leverage, axis=0), leverage
 
     @staticmethod
-    def _flatten_eod(weights: pd.DataFrame) -> pd.DataFrame:
+    def _eod_mask(index: pd.DatetimeIndex) -> np.ndarray:
+        """Boolean mask: True on the last bar of each trading day."""
+        days = pd.Series(index.normalize(), index=index)
+        return (days != days.shift(-1)).to_numpy()
+
+    @classmethod
+    def _flatten_eod(cls, weights: pd.DataFrame) -> pd.DataFrame:
         """Zero the weights on the last bar of each trading day (go flat EOD)."""
-        days = pd.Series(weights.index.normalize(), index=weights.index)
-        is_last_of_day = days != days.shift(-1)   # True on each day's final bar
         w = weights.copy()
-        w.loc[is_last_of_day.values] = 0.0
+        w.loc[cls._eod_mask(weights.index)] = 0.0
         return w
+
+    @staticmethod
+    def _throttle(weights: pd.DataFrame, every: int) -> pd.DataFrame:
+        """#2 Rebalance only every *every* bars; hold target in between."""
+        keep = pd.Series((np.arange(len(weights)) % every) == 0, index=weights.index)
+        return weights.where(keep, axis=0).ffill().fillna(0.0)
+
+    @staticmethod
+    def _apply_no_trade_band(
+        weights: pd.DataFrame, band: float, eod_mask: Optional[np.ndarray] = None
+    ) -> pd.DataFrame:
+        """#1 Hysteresis: only trade a name when its target weight drifts more
+        than *band* (relative) from the currently-held weight; otherwise hold.
+
+        ``eod_mask`` (intraday) forces the book flat on each day's last bar, so
+        the no-overnight guarantee is preserved and the band resets each day.
+        """
+        W = weights.to_numpy(dtype=float)
+        out = np.empty_like(W)
+        held = np.zeros(W.shape[1])
+        for i in range(W.shape[0]):
+            if eod_mask is not None and eod_mask[i]:
+                held = np.zeros_like(held)            # mandatory EOD flatten
+            else:
+                target = W[i]
+                denom = np.maximum.reduce([np.abs(target), np.abs(held),
+                                           np.full_like(target, 1e-9)])
+                trade = np.abs(target - held) > band * denom
+                held = np.where(trade, target, held)
+            out[i] = held
+        return pd.DataFrame(out, index=weights.index, columns=weights.columns)
 
     def run(
         self,
@@ -1308,11 +1360,24 @@ class Backtester:
         raw_weights = strategy.generate_weights(close).reindex(close.index)
         asset_rets = close.pct_change().reindex(close.index)
 
-        leverage = None
         weights = raw_weights
+        # #3 Signal smoothing: EMA the target weights so positions move gradually.
+        if self.signal_smooth:
+            weights = weights.ewm(span=int(self.signal_smooth)).mean()
+
+        leverage = None
         if self.target_vol is not None:
-            weights, leverage = self._vol_target_weights(raw_weights, asset_rets)
-        if self.intraday:
+            weights, leverage = self._vol_target_weights(weights, asset_rets)
+
+        # #2 Rebalance throttle: only act every N bars.
+        if self.rebalance_every and self.rebalance_every > 1:
+            weights = self._throttle(weights, int(self.rebalance_every))
+
+        # #1 No-trade band (hysteresis) and/or EOD flatten for intraday.
+        eod_mask = self._eod_mask(weights.index) if self.intraday else None
+        if self.no_trade_band:
+            weights = self._apply_no_trade_band(weights, self.no_trade_band, eod_mask)
+        elif self.intraday:
             # Flat into the close -> lagged weight on the next day's first bar is
             # zero, so the overnight gap return is excluded.
             weights = self._flatten_eod(weights)
@@ -1374,6 +1439,10 @@ class WalkForwardValidator:
         ``"anchored"`` (expanding IS) or ``"rolling"`` (fixed-length IS).
     scoring:
         Metric maximised during optimisation (default ``"sharpe"``).
+    turnover_penalty:
+        Turnover control #6.  Subtract ``turnover_penalty * turnover_per_bar``
+        from each candidate's in-sample score, so parameter selection prefers
+        lower-churn (more implementable) configurations.  ``0`` = off.
     """
 
     def __init__(
@@ -1387,17 +1456,25 @@ class WalkForwardValidator:
         vol_window: int = 20,
         max_leverage: float = 3.0,
         intraday: bool = False,
+        signal_smooth: Optional[int] = None,
+        rebalance_every: int = 1,
+        no_trade_band: Optional[float] = None,
+        turnover_penalty: float = 0.0,
     ) -> None:
         self.n_splits = n_splits
         self.train_span = train_span
         self.mode = mode
         self.scoring = scoring
+        self.turnover_penalty = turnover_penalty
         self.backtester = Backtester(
             cost_bps=cost_bps,
             target_vol=target_vol,
             vol_window=vol_window,
             max_leverage=max_leverage,
             intraday=intraday,
+            signal_smooth=signal_smooth,
+            rebalance_every=rebalance_every,
+            no_trade_band=no_trade_band,
         )
 
     @staticmethod
@@ -1448,6 +1525,9 @@ class WalkForwardValidator:
                 # Per-asset breakdown not needed while scoring candidates.
                 is_res = self.backtester.run(strat, is_slice, with_assets=False)
                 score = is_res.metrics.get(self.scoring, np.nan)
+                # #6 Penalise turnover so selection favours implementable params.
+                if self.turnover_penalty and is_res.turnover is not None:
+                    score = score - self.turnover_penalty * float(is_res.turnover.mean())
                 if np.isfinite(score) and score > best_score:
                     best_score, best_params = score, params
 
@@ -1519,6 +1599,10 @@ class QuantLab:
         max_leverage: float = 3.0,
         intraday: bool = False,
         cache_dir: Optional[str] = None,
+        signal_smooth: Optional[int] = None,
+        rebalance_every: int = 1,
+        no_trade_band: Optional[float] = None,
+        turnover_penalty: float = 0.0,
     ) -> None:
         self.market = MarketData(data_dir, cache_dir=cache_dir)
         self.classifier = TickerClassifier
@@ -1527,9 +1611,16 @@ class QuantLab:
         self.vol_window = vol_window
         self.max_leverage = max_leverage
         self.intraday = intraday
+        # Turnover controls (#1 band, #2 throttle, #3 smoothing, #6 penalty).
+        self.signal_smooth = signal_smooth
+        self.rebalance_every = rebalance_every
+        self.no_trade_band = no_trade_band
+        self.turnover_penalty = turnover_penalty
         self.backtester = Backtester(
             cost_bps=cost_bps, target_vol=target_vol,
             vol_window=vol_window, max_leverage=max_leverage, intraday=intraday,
+            signal_smooth=signal_smooth, rebalance_every=rebalance_every,
+            no_trade_band=no_trade_band,
         )
         self.contract = "F1"
         self.frequency = "daily"
@@ -1596,7 +1687,10 @@ class QuantLab:
             validator = WalkForwardValidator(
                 cost_bps=self.cost_bps, target_vol=self.target_vol,
                 vol_window=self.vol_window, max_leverage=self.max_leverage,
-                intraday=self.intraday,
+                intraday=self.intraday, signal_smooth=self.signal_smooth,
+                rebalance_every=self.rebalance_every,
+                no_trade_band=self.no_trade_band,
+                turnover_penalty=self.turnover_penalty,
             )
             return validator.run(cls, close, grid, name=result_name)
         return self.backtester.run(cls(**params), close, name=result_name)
