@@ -476,6 +476,43 @@ _METRIC_KEYS = [
     "skewness", "kurtosis", "total_return", "n_periods",
 ]
 
+#: Execution / implementation columns appended after the return metrics.
+_EXEC_KEYS = [
+    "gross_leverage", "turnover_per_bar", "ann_turnover",
+    "tcost_bps", "cost_drag_ann",
+]
+
+
+def execution_stats(result: "BacktestResult") -> Dict[str, float]:
+    """Implementation cost profile of a backtest.
+
+    Returns
+    -------
+    dict with
+        gross_leverage    : average book size, mean of sum(|weights|)
+        turnover_per_bar  : mean of sum(|dweight|) per bar (both sides)
+        ann_turnover      : turnover_per_bar annualised (book turns / year)
+        tcost_bps         : the per-bar transaction-cost assumption used
+        cost_drag_ann     : annualised return given up to costs
+                            (turnover_per_bar * tcost_bps/1e4 * periods/year)
+    """
+    out = {k: np.nan for k in _EXEC_KEYS}
+    out["tcost_bps"] = result.meta.get("tcost_bps", np.nan)
+
+    ref = result.returns
+    ppy = infer_periods_per_year(ref.index) if ref is not None and len(ref) > 2 else 252.0
+
+    if result.turnover is not None and len(result.turnover):
+        tpb = float(result.turnover.mean())
+        out["turnover_per_bar"] = tpb
+        out["ann_turnover"] = tpb * ppy
+        tc = out["tcost_bps"]
+        if tc is not None and np.isfinite(tc):
+            out["cost_drag_ann"] = tpb * (tc / 1e4) * ppy
+    if result.gross_exposure is not None and len(result.gross_exposure):
+        out["gross_leverage"] = float(result.gross_exposure.mean())
+    return out
+
 
 @dataclass
 class BacktestResult:
@@ -489,6 +526,7 @@ class BacktestResult:
     gross_returns: Optional[pd.Series] = None   # before transaction costs
     turnover: Optional[pd.Series] = None        # per-bar gross weight change
     asset_returns: Optional[pd.DataFrame] = None  # time x asset NET contribution
+    gross_exposure: Optional[pd.Series] = None  # per-bar sum(|weights|) = leverage
 
     @property
     def equity_curve(self) -> pd.Series:
@@ -525,10 +563,15 @@ class BacktestResult:
 
 
 def report(results: Sequence[BacktestResult], sort_by: str = "sharpe") -> pd.DataFrame:
-    """Build a tidy metric-comparison table across several backtests."""
-    rows = {res.name: res.metrics for res in results}
+    """Build a tidy metric-comparison table across several backtests.
+
+    Columns are the return/risk metrics followed by execution stats (leverage,
+    turnover and the transaction-cost assumption) so each strategy's
+    implementability is visible alongside its performance.
+    """
+    rows = {res.name: {**res.metrics, **execution_stats(res)} for res in results}
     tbl = pd.DataFrame(rows).T
-    cols = [c for c in _METRIC_KEYS if c in tbl.columns]
+    cols = [c for c in _METRIC_KEYS + _EXEC_KEYS if c in tbl.columns]
     tbl = tbl[cols]
     if sort_by in tbl.columns:
         tbl = tbl.sort_values(sort_by, ascending=False)
@@ -891,6 +934,7 @@ def save_run(
         row: Dict[str, Any] = {"run_id": run_id, "created_utc": ts, "strategy": r.name}
         row.update({k: config.get(k) for k in _RUN_CONFIG_KEYS})
         row.update({k: r.metrics.get(k) for k in _METRIC_KEYS})
+        row.update(execution_stats(r))
         rows.append(row)
     log_path = os.path.join(out_dir, "runs_log.csv")
     pd.DataFrame(rows).to_csv(
@@ -1281,16 +1325,18 @@ class Backtester:
         asset_gross = lagged * asset_rets
         gross = asset_gross.sum(axis=1)
         turnover = weight_chg.sum(axis=1).fillna(0.0)
+        gross_exposure = weights.abs().sum(axis=1)        # book size / leverage
         net = (gross - turnover * (self.cost_bps / 1e4)).fillna(0.0)
         # Drop the first bar (no prior weight) and align series to net.
         gross, turnover, net = gross.iloc[1:], turnover.iloc[1:], net.iloc[1:]
+        gross_exposure = gross_exposure.iloc[1:]
 
         asset_net = None
         if with_assets:
             asset_net = (asset_gross - weight_chg * (self.cost_bps / 1e4)).iloc[1:]
 
         meta = {"params": dict(strategy.params), "kind": strategy.kind,
-                "intraday": self.intraday}
+                "intraday": self.intraday, "tcost_bps": self.cost_bps}
         if leverage is not None:
             meta["target_vol"] = self.target_vol
             meta["avg_leverage"] = float(leverage.replace(0.0, np.nan).mean())
@@ -1303,6 +1349,7 @@ class Backtester:
             gross_returns=gross,
             turnover=turnover,
             asset_returns=asset_net,
+            gross_exposure=gross_exposure,
         )
         return res
 
@@ -1380,6 +1427,7 @@ class WalkForwardValidator:
         oos_returns: List[pd.Series] = []
         oos_gross: List[pd.Series] = []
         oos_turnover: List[pd.Series] = []
+        oos_exposure: List[pd.Series] = []
         oos_assets: List[pd.DataFrame] = []
         chosen: List[Dict[str, Any]] = []
 
@@ -1411,6 +1459,8 @@ class WalkForwardValidator:
             if oos_res.gross_returns is not None:
                 oos_gross.append(oos_res.gross_returns.loc[oos_res.gross_returns.index >= cutoff])
                 oos_turnover.append(oos_res.turnover.loc[oos_res.turnover.index >= cutoff])
+            if oos_res.gross_exposure is not None:
+                oos_exposure.append(oos_res.gross_exposure.loc[oos_res.gross_exposure.index >= cutoff])
             if oos_res.asset_returns is not None:
                 oos_assets.append(oos_res.asset_returns.loc[oos_res.asset_returns.index >= cutoff])
             chosen.append(best_params)
@@ -1438,10 +1488,12 @@ class WalkForwardValidator:
                 "chosen_params": chosen,
                 "kind": strategy_cls.kind,
                 "intraday": self.backtester.intraday,
+                "tcost_bps": self.backtester.cost_bps,
             },
             gross_returns=_stitch(oos_gross),
             turnover=_stitch(oos_turnover),
             asset_returns=_stitch_df(oos_assets),
+            gross_exposure=_stitch(oos_exposure),
         )
 
 

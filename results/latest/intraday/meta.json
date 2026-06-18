@@ -1,6 +1,6 @@
 {
-  "run_id": "20260618T054713Z_intraday_idx_50eq",
-  "created_utc": "20260618T054713Z",
+  "run_id": "20260618T060248Z_intraday_idx_50eq",
+  "created_utc": "20260618T060248Z",
   "config": {
     "frequency": "minutely",
     "contract": "F1",
