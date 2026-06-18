@@ -42,6 +42,8 @@ from __future__ import annotations
 import os
 import re
 import glob
+import json
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -130,6 +132,43 @@ _RAW_COLUMN_MAP: Dict[str, str] = {
 _FILENAME_RE = re.compile(r"^(?P<ticker>.+)_(?P<contract>F\d+)\.csv$", re.IGNORECASE)
 
 
+def _parse_mixed_datetime(date_col: pd.Series, time_col: pd.Series) -> pd.Series:
+    """Parse the dataset's *inconsistent* date formats into a DatetimeIndex.
+
+    The vendor files mix conventions across months:
+
+    * most files use ``MM/DD/YYYY`` with slashes (e.g. ``03/31/2023``);
+    * the Aug-Dec 2023 files use ``DD-MM-YYYY`` with dashes (e.g. ``29-12-2023``).
+
+    Day-first vs month-first is detected *per file* from the data itself: a full
+    trading month always contains a day > 12, so whichever component exceeds 12
+    pins down the layout.  If that is inconclusive we fall back to whichever
+    interpretation yields fewer unparseable rows.  This avoids the silent
+    truncation/scrambling that a single hard-coded format caused.
+    """
+    date_str = date_col.astype(str).str.strip().str.replace("-", "/", regex=False)
+    combined = date_str + " " + time_col.astype(str).str.strip()
+
+    parts = date_str.str.split("/", expand=True)
+    first = pd.to_numeric(parts[0], errors="coerce")
+    second = pd.to_numeric(parts[1], errors="coerce")
+
+    if first.max() is not None and first.max() > 12:
+        dayfirst = True          # first component is a day -> DD/MM/YYYY
+    elif second.max() is not None and second.max() > 12:
+        dayfirst = False         # second component is a day -> MM/DD/YYYY
+    else:
+        dayfirst = None          # inconclusive (e.g. only days 1-12 present)
+
+    if dayfirst is None:
+        mdy = pd.to_datetime(combined, format="%m/%d/%Y %H:%M:%S", errors="coerce")
+        dmy = pd.to_datetime(combined, format="%d/%m/%Y %H:%M:%S", errors="coerce")
+        return dmy if dmy.isna().sum() < mdy.isna().sum() else mdy
+
+    fmt = "%d/%m/%Y %H:%M:%S" if dayfirst else "%m/%d/%Y %H:%M:%S"
+    return pd.to_datetime(combined, format=fmt, errors="coerce")
+
+
 class MarketData:
     """Index the on-disk CSV universe and load it as a tidy OHLCV+OI panel.
 
@@ -138,10 +177,17 @@ class MarketData:
     data_dir:
         Root folder that contains the ``Futures IEOD-<Month> <Year>`` sub
         folders.  Defaults to ``"Data"`` relative to the working directory.
+    cache_dir:
+        Where to store resampled per-ticker parquet caches.  Reading the ~4900
+        raw minute CSVs and resampling is slow (~1-2 min for the full
+        universe); once a (ticker, contract, frequency) frame is built it is
+        written here and reused instantly on subsequent loads.  Defaults to
+        ``"<data_dir>/.qr_cache"``.
     """
 
-    def __init__(self, data_dir: str = "Data") -> None:
+    def __init__(self, data_dir: str = "Data", cache_dir: Optional[str] = None) -> None:
         self.data_dir = data_dir
+        self.cache_dir = cache_dir or os.path.join(data_dir, ".qr_cache")
         # {(ticker, contract): [csv_path, ...]} sorted chronologically-ish.
         self._index: Dict[Tuple[str, str], List[str]] = {}
         self.data: Dict[str, pd.DataFrame] = {}
@@ -183,16 +229,10 @@ class MarketData:
     def _read_raw(path: str) -> pd.DataFrame:
         """Read one raw csv into a DatetimeIndexed OHLCV+OI frame."""
         df = pd.read_csv(path)
-        # Normalise the ``<open>`` style headers.
+        # Normalise the ``<open>`` / ``<o/i>`` / ``<OI>`` style headers.
         df.columns = [c.strip().strip("<>").strip().lower() for c in df.columns]
-        # Combine date (dd/mm/yyyy) + time into a single index.
-        dt = pd.to_datetime(
-            df["date"].astype(str).str.replace("-", "/", regex=False)
-            + " "
-            + df["time"].astype(str),
-            format="%d/%m/%Y %H:%M:%S",
-            errors="coerce",
-        )
+        # Date format varies by file (MM/DD/YYYY vs DD-MM-YYYY) -> detect per file.
+        dt = _parse_mixed_datetime(df["date"], df["time"])
         df = df.rename(columns=_RAW_COLUMN_MAP)
         keep = [c for c in ALL_FEATURES if c in df.columns]
         out = df[keep].copy()
@@ -228,6 +268,49 @@ class MarketData:
         # Drop empty buckets (weekends / non-trading periods).
         return out.dropna(how="all").dropna(subset=["Close"])
 
+    # -- caching -----------------------------------------------------------
+    def _cache_path(self, ticker: str, contract: str, freq: str) -> str:
+        safe_freq = freq.replace("/", "")  # offset aliases are filename-safe anyway
+        return os.path.join(
+            self.cache_dir, contract.upper(), safe_freq, f"{ticker.upper()}.parquet"
+        )
+
+    def _get_resampled(
+        self, ticker: str, contract: str, freq: str,
+        use_cache: bool, rebuild_cache: bool,
+    ) -> pd.DataFrame:
+        """Return the full-feature resampled frame, reading/writing the cache.
+
+        Raises ``KeyError`` (via :meth:`_load_one`) when no source file exists.
+        """
+        path = self._cache_path(ticker, contract, freq)
+        if use_cache and not rebuild_cache and os.path.exists(path):
+            try:
+                return pd.read_parquet(path)
+            except Exception as exc:  # corrupt cache -> rebuild
+                print(f"[MarketData] cache read failed for {ticker} ({exc}); rebuilding")
+
+        df = self._resample(self._load_one(ticker, contract), freq)
+        if use_cache:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                df.to_parquet(path)
+            except Exception as exc:
+                print(f"[MarketData] cache write failed for {ticker}: {exc}")
+        return df
+
+    def clear_cache(self, contract: Optional[str] = None, frequency: Optional[str] = None) -> None:
+        """Delete cached parquet files (optionally scoped to contract/frequency)."""
+        import shutil
+        target = self.cache_dir
+        if contract is not None:
+            target = os.path.join(target, contract.upper())
+            if frequency is not None:
+                target = os.path.join(target, FREQUENCY_ALIASES.get(frequency, frequency))
+        if os.path.exists(target):
+            shutil.rmtree(target)
+            print(f"[MarketData] cleared cache at {target}")
+
     def load(
         self,
         tickers: Optional[Sequence[str]] = None,
@@ -236,6 +319,8 @@ class MarketData:
         features: Optional[Sequence[str]] = None,
         start: Optional[str] = None,
         end: Optional[str] = None,
+        use_cache: bool = True,
+        rebuild_cache: bool = False,
     ) -> Dict[str, pd.DataFrame]:
         """Load historical bars.
 
@@ -253,6 +338,12 @@ class MarketData:
             Subset of ``Open, High, Low, Close, Volume, OI``; ``None`` keeps all.
         start, end:
             Optional ISO date strings to clip the sample.
+        use_cache:
+            Read/write the resampled per-ticker parquet cache (default True).
+            The first full-universe load is slow; later ones are near-instant.
+        rebuild_cache:
+            Ignore any existing cache and rebuild it from the raw CSVs (use
+            after the underlying data changes).
 
         Returns
         -------
@@ -272,11 +363,10 @@ class MarketData:
         for t in tickers:
             t = t.upper()
             try:
-                df = self._load_one(t, contract)
+                df = self._get_resampled(t, contract, freq, use_cache, rebuild_cache)
             except KeyError:
                 print(f"[MarketData] skip {t}: no {contract} file")
                 continue
-            df = self._resample(df, freq)
             cols = [c for c in features if c in df.columns]
             df = df[cols]
             if start is not None:
@@ -394,6 +484,54 @@ _METRIC_KEYS = [
     "skewness", "kurtosis", "total_return", "n_periods",
 ]
 
+#: Execution / implementation columns appended after the return metrics.
+_EXEC_KEYS = [
+    "gross_leverage", "turnover_per_bar", "ann_turnover",
+    "tcost_bps", "realized_cost_bps", "cost_drag_ann",
+]
+
+
+def execution_stats(result: "BacktestResult") -> Dict[str, float]:
+    """Implementation cost profile of a backtest.
+
+    Returns
+    -------
+    dict with
+        gross_leverage    : average book size, mean of sum(|weights|)
+        turnover_per_bar  : mean of sum(|dweight|) per bar (both sides)
+        ann_turnover      : turnover_per_bar annualised (book turns / year)
+        tcost_bps         : the assumed spread/linear cost (bps)
+        realized_cost_bps : effective cost actually paid per unit turnover,
+                            incl. market impact -- derived from gross vs net
+        cost_drag_ann     : annualised return actually given up to costs
+                            (gross minus net), so impact is captured
+    """
+    out = {k: np.nan for k in _EXEC_KEYS}
+    out["tcost_bps"] = result.meta.get("tcost_bps", np.nan)
+
+    ref = result.returns
+    ppy = infer_periods_per_year(ref.index) if ref is not None and len(ref) > 2 else 252.0
+
+    tpb = np.nan
+    if result.turnover is not None and len(result.turnover):
+        tpb = float(result.turnover.mean())
+        out["turnover_per_bar"] = tpb
+        out["ann_turnover"] = tpb * ppy
+    if result.gross_exposure is not None and len(result.gross_exposure):
+        out["gross_leverage"] = float(result.gross_exposure.mean())
+
+    # Realised cost straight from gross vs net -> captures impact, not just the
+    # assumed spread.  Falls back to the linear assumption if gross is absent.
+    if result.gross_returns is not None and result.returns is not None \
+            and len(result.gross_returns) == len(result.returns):
+        drag_per_bar = float(result.gross_returns.mean() - result.returns.mean())
+        out["cost_drag_ann"] = drag_per_bar * ppy
+        if np.isfinite(tpb) and tpb > 0:
+            out["realized_cost_bps"] = drag_per_bar / tpb * 1e4
+    elif np.isfinite(tpb) and np.isfinite(out["tcost_bps"]):
+        out["cost_drag_ann"] = tpb * (out["tcost_bps"] / 1e4) * ppy
+    return out
+
 
 @dataclass
 class BacktestResult:
@@ -406,6 +544,8 @@ class BacktestResult:
     meta: Dict[str, Any] = field(default_factory=dict)
     gross_returns: Optional[pd.Series] = None   # before transaction costs
     turnover: Optional[pd.Series] = None        # per-bar gross weight change
+    asset_returns: Optional[pd.DataFrame] = None  # time x asset NET contribution
+    gross_exposure: Optional[pd.Series] = None  # per-bar sum(|weights|) = leverage
 
     @property
     def equity_curve(self) -> pd.Series:
@@ -413,6 +553,22 @@ class BacktestResult:
 
     def summary(self) -> pd.Series:
         return pd.Series(self.metrics, name=self.name)
+
+    def asset_sharpe(self, periods_per_year: Optional[float] = None) -> pd.Series:
+        """Annualised Sharpe of each asset's net contribution to the strategy.
+
+        Shows which names actually drive (or drag) the strategy's P&L.  Assets
+        that never traded (all-zero contribution) are dropped.  Returns an empty
+        Series if per-asset contributions were not stored.
+        """
+        if self.asset_returns is None or self.asset_returns.empty:
+            return pd.Series(dtype=float, name=self.name)
+        ar = self.asset_returns
+        ppy = periods_per_year or infer_periods_per_year(ar.index)
+        active = ar.loc[:, (ar != 0).any(axis=0)]
+        std = active.std()
+        sharpe = active.mean() / std.replace(0, np.nan) * np.sqrt(ppy)
+        return sharpe.rename(self.name).sort_values(ascending=False)
 
     def net_returns_at_cost(self, cost_bps: float) -> pd.Series:
         """Recompute net returns at an arbitrary *cost_bps* (no re-run needed).
@@ -426,18 +582,38 @@ class BacktestResult:
 
 
 def report(results: Sequence[BacktestResult], sort_by: str = "sharpe") -> pd.DataFrame:
-    """Build a tidy metric-comparison table across several backtests."""
-    rows = {res.name: res.metrics for res in results}
+    """Build a tidy metric-comparison table across several backtests.
+
+    Columns are the return/risk metrics followed by execution stats (leverage,
+    turnover and the transaction-cost assumption) so each strategy's
+    implementability is visible alongside its performance.
+    """
+    rows = {res.name: {**res.metrics, **execution_stats(res)} for res in results}
     tbl = pd.DataFrame(rows).T
-    cols = [c for c in _METRIC_KEYS if c in tbl.columns]
+    cols = [c for c in _METRIC_KEYS + _EXEC_KEYS if c in tbl.columns]
     tbl = tbl[cols]
     if sort_by in tbl.columns:
         tbl = tbl.sort_values(sort_by, ascending=False)
     return tbl
 
 
-#: Default transaction-cost ladder (basis points) for sensitivity analysis.
+def asset_sharpe_table(results: Sequence[BacktestResult]) -> pd.DataFrame:
+    """``asset x strategy`` table of each asset's Sharpe within each strategy.
+
+    Reveals which names drive or drag every strategy.  Assets a strategy never
+    traded show as NaN for that column.
+    """
+    cols = {res.name: res.asset_sharpe() for res in results}
+    cols = {k: v for k, v in cols.items() if not v.empty}
+    if not cols:
+        return pd.DataFrame()
+    return pd.DataFrame(cols).sort_index()
+
+
+#: Default transaction-cost ladder (basis points) for daily/low-turnover work.
 DEFAULT_COST_LEVELS: List[float] = [1, 2, 5, 7, 10, 15, 20, 25]
+#: Default ladder for intraday/high-turnover work, where the edge lives sub-1bp.
+DEFAULT_INTRADAY_COST_LEVELS: List[float] = [round(0.1 * i, 2) for i in range(11)]
 
 
 def sharpe_vs_cost(
@@ -463,6 +639,30 @@ def sharpe_vs_cost(
         for c in cost_levels
     }
     return pd.Series(out, name=result.name)
+
+
+def cost_sensitivity_table(
+    results: Sequence[BacktestResult],
+    cost_levels: Optional[Sequence[float]] = None,
+    metric: str = "sharpe",
+) -> pd.DataFrame:
+    """``cost(bps) x strategy`` table of *metric* across a transaction-cost ladder.
+
+    When *cost_levels* is omitted the ladder defaults to the sub-1bp intraday
+    range for high-frequency data and the 1->25bp range otherwise (matching the
+    dashboard).  Strategies without stored gross/turnover are skipped.
+    """
+    if cost_levels is None:
+        probe = next((r.returns for r in results if r.returns is not None and len(r.returns) > 2), None)
+        intraday = probe is not None and infer_periods_per_year(probe.index) > 300
+        cost_levels = DEFAULT_INTRADAY_COST_LEVELS if intraday else DEFAULT_COST_LEVELS
+    cols = {r.name: sharpe_vs_cost(r, cost_levels, metric=metric) for r in results}
+    cols = {k: v for k, v in cols.items() if not v.empty}
+    if not cols:
+        return pd.DataFrame()
+    tbl = pd.DataFrame(cols)
+    tbl.index.name = "cost_bps"
+    return tbl
 
 
 def plot_dashboard(
@@ -501,7 +701,10 @@ def plot_dashboard(
     log_equity:
         Plot the equity curve on a log scale.
     cost_levels:
-        Transaction-cost ladder (bps) for the degradation panel.
+        Transaction-cost ladder (bps) for the degradation panel.  When omitted
+        it defaults to :data:`DEFAULT_INTRADAY_COST_LEVELS` (0 -> 1 bp) for
+        intraday data and :data:`DEFAULT_COST_LEVELS` (1 -> 25 bp) otherwise.
+        Pass an explicit list (e.g. ``np.linspace(0, 1, 21)``) to set the range.
     save_path:
         If given, the figure is also written to disk.
 
@@ -513,7 +716,6 @@ def plot_dashboard(
 
     if not results:
         raise ValueError("Nothing to plot.")
-    cost_levels = list(cost_levels) if cost_levels is not None else DEFAULT_COST_LEVELS
 
     fig, axes = plt.subplots(2, 3, figsize=figsize)
     ax_eq, ax_dd, ax_sharpe = axes[0]
@@ -523,6 +725,12 @@ def plot_dashboard(
     # sub-daily data we plot against a positional bar index instead.
     probe = next((res.returns for res in results if len(res.returns) > 2), None)
     intraday_x = probe is not None and infer_periods_per_year(probe.index) > 300
+
+    # Cost ladder: tight sub-1bp range for intraday, wider for daily.
+    if cost_levels is None:
+        cost_levels = DEFAULT_INTRADAY_COST_LEVELS if intraday_x else DEFAULT_COST_LEVELS
+    else:
+        cost_levels = list(cost_levels)
 
     def _xaxis(series: pd.Series):
         return np.arange(len(series)) if intraday_x else series.index
@@ -592,18 +800,18 @@ def plot_dashboard(
         ax_cost.set_xlabel("transaction cost (bps per bar)")
         ax_cost.set_ylabel(metric)
         ax_cost.legend(fontsize=7, ncol=2)
-        # Strategies can plunge to large negatives at high cost while the action
-        # of interest (the break-even crossing) sits near zero.  A symlog scale
-        # keeps the near-zero band linear and readable yet still shows the
-        # collapse, instead of one strategy squashing all the others.
+        # Use symlog only when a strategy plunges far below the others (wide
+        # range), so the near-zero break-even band stays readable.  For a tight
+        # range (e.g. the sub-1bp intraday ladder) keep a plain linear scale.
         if all_vals:
-            hi = max(all_vals)
-            linthresh = max(2.0, abs(hi))
-            ax_cost.set_yscale("symlog", linthresh=linthresh)
+            lo, hi = min(all_vals), max(all_vals)
+            if lo < -max(4.0, 3.0 * abs(hi)):
+                ax_cost.set_yscale("symlog", linthresh=max(2.0, abs(hi)))
     else:
         ax_cost.text(0.5, 0.5, "no gross/turnover stored\n(run via Backtester)",
                      ha="center", va="center", transform=ax_cost.transAxes)
-    ax_cost.set_title(f"{metric} degradation vs cost")
+    cost_lo, cost_hi = min(cost_levels), max(cost_levels)
+    ax_cost.set_title(f"{metric} vs cost  ({cost_lo:g}-{cost_hi:g} bps)")
     ax_cost.grid(alpha=0.3)
 
     # -- panel 6: risk / return map ---------------------------------------
@@ -628,6 +836,202 @@ def plot_dashboard(
         fig.savefig(save_path, dpi=120, bbox_inches="tight")
         print(f"[plot_dashboard] saved to {save_path}")
     return fig
+
+
+def plot_capacity_frontier(
+    frontiers: Dict[str, pd.DataFrame],
+    metric: str = "sharpe",
+    figsize: Tuple[float, float] = (10, 6),
+    title: Optional[str] = None,
+    save_path: Optional[str] = None,
+):
+    """Plot impact-aware *metric* vs book size for one or more frontier sweeps.
+
+    ``frontiers`` maps a label (e.g. ``"5-min"``) to the DataFrame returned by
+    :meth:`QuantLab.capacity_frontier`.  Each curve's Sharpe=0 capacity
+    (``df.attrs['frontier_capital']``) is marked with a dashed line.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=figsize)
+    cmap = plt.get_cmap("tab10")
+    for i, (label, df) in enumerate(frontiers.items()):
+        color = cmap(i % 10)
+        ax.plot(df["capital"], df[metric], marker="o", color=color, label=label, lw=1.6)
+        fc = df.attrs.get("frontier_capital", np.nan)
+        if np.isfinite(fc):
+            ax.axvline(fc, color=color, ls="--", alpha=0.6)
+            ax.annotate(f"{label} capacity\n{fc:,.0f}", xy=(fc, 0),
+                        xytext=(6, 12 + 14 * i), textcoords="offset points",
+                        fontsize=8, color=color)
+    ax.set_xscale("log")
+    ax.axhline(0.0, color="grey", lw=1.0)
+    ax.set_xlabel("book size (currency, log scale)")
+    ax.set_ylabel(f"impact-aware {metric}")
+    ax.set_title(title or "Capacity frontier: Sharpe vs book size")
+    ax.legend()
+    ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=120, bbox_inches="tight")
+        print(f"[plot_capacity_frontier] saved to {save_path}")
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# 3b. Results persistence (track & compare runs over time)
+# ---------------------------------------------------------------------------
+#: Config keys recorded alongside each run for cross-run comparison.
+_RUN_CONFIG_KEYS = [
+    "frequency", "contract", "cost_bps", "target_vol", "intraday",
+    "vol_window", "max_leverage", "n_assets",
+    "signal_smooth", "rebalance_every", "no_trade_band", "turnover_penalty",
+    "impact_coef_bps", "capital", "liquidity_power",
+]
+
+
+def _write_run_artifacts(
+    target_dir: str,
+    results: Sequence[BacktestResult],
+    meta: Dict[str, Any],
+    save_returns: bool,
+) -> None:
+    """Write metrics/asset-Sharpe/returns/meta into *target_dir*."""
+    os.makedirs(target_dir, exist_ok=True)
+    report(results).to_csv(os.path.join(target_dir, "metrics.csv"))
+
+    asset_tbl = asset_sharpe_table(results)
+    if not asset_tbl.empty:
+        asset_tbl.to_csv(os.path.join(target_dir, "asset_sharpe.csv"))
+
+    cost_tbl = cost_sensitivity_table(results)
+    if not cost_tbl.empty:
+        cost_tbl.to_csv(os.path.join(target_dir, "cost_sensitivity.csv"))
+
+    if save_returns:
+        nets = {r.name: r.returns for r in results if r.returns is not None}
+        if nets:
+            pd.DataFrame(nets).sort_index().to_parquet(
+                os.path.join(target_dir, "returns.parquet")
+            )
+        gross = {r.name: r.gross_returns for r in results if r.gross_returns is not None}
+        if gross:
+            pd.DataFrame(gross).sort_index().to_parquet(
+                os.path.join(target_dir, "gross_returns.parquet")
+            )
+
+    with open(os.path.join(target_dir, "meta.json"), "w") as fh:
+        json.dump(meta, fh, indent=2, default=str)
+
+
+def save_run(
+    results: Sequence[BacktestResult],
+    out_dir: str = "results",
+    run_name: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+    save_returns: bool = True,
+    latest: bool = True,
+    latest_label: Optional[str] = None,
+) -> str:
+    """Persist a batch of backtests so runs can be compared over time.
+
+    Creates ``<out_dir>/<run_id>/`` containing:
+
+    * ``metrics.csv``          -- the metric table (one row per strategy)
+    * ``asset_sharpe.csv``     -- ``asset x strategy`` Sharpe of each name's
+      contribution within each strategy
+    * ``cost_sensitivity.csv`` -- ``cost(bps) x strategy`` Sharpe degradation
+      across the transaction-cost ladder
+    * ``returns.parquet``      -- wide ``time x strategy`` OOS net returns
+      (and ``gross_returns.parquet`` when available, for cost re-analysis)
+    * ``meta.json``            -- run config + per-strategy chosen parameters
+
+    and appends one row per strategy to the cumulative master log
+    ``<out_dir>/runs_log.csv`` -- the file to read when tracking how a strategy's
+    performance drifts across data, costs or parameter changes.
+
+    When ``latest`` is True (default) the same artifacts are also mirrored to a
+    stable ``<out_dir>/latest/<latest_label>/`` folder (or ``<out_dir>/latest/``
+    when no label), so an always-current copy can be kept under version control
+    without committing every timestamped run.  Use distinct labels (e.g.
+    ``"daily"`` vs ``"intraday"``) to keep one snapshot per configuration.
+
+    Returns
+    -------
+    str
+        The created (timestamped) run directory.
+    """
+    config = dict(config or {})
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = f"{ts}_{run_name}" if run_name else ts
+    run_dir = os.path.join(out_dir, run_id)
+
+    meta = {
+        "run_id": run_id,
+        "created_utc": ts,
+        "config": config,
+        "strategies": {
+            r.name: {
+                "kind": r.meta.get("kind"),
+                "chosen_params": r.meta.get("chosen_params", r.meta.get("params")),
+            }
+            for r in results
+        },
+    }
+
+    _write_run_artifacts(run_dir, results, meta, save_returns)
+    latest_dir = None
+    if latest:
+        import shutil
+        latest_dir = os.path.join(out_dir, "latest", latest_label) if latest_label \
+            else os.path.join(out_dir, "latest")
+        if os.path.isdir(latest_dir):
+            shutil.rmtree(latest_dir)
+        _write_run_artifacts(latest_dir, results, meta, save_returns)
+
+    # Append to the cumulative master log (long format: one row per strategy).
+    rows = []
+    for r in results:
+        row: Dict[str, Any] = {"run_id": run_id, "created_utc": ts, "strategy": r.name}
+        row.update({k: config.get(k) for k in _RUN_CONFIG_KEYS})
+        row.update({k: r.metrics.get(k) for k in _METRIC_KEYS})
+        row.update(execution_stats(r))
+        rows.append(row)
+    log_path = os.path.join(out_dir, "runs_log.csv")
+    pd.DataFrame(rows).to_csv(
+        log_path, mode="a", header=not os.path.exists(log_path), index=False
+    )
+    print(f"[save_run] wrote {run_dir}"
+          + (f" (+ {latest_dir})" if latest_dir else "")
+          + f"; appended {len(rows)} rows to {log_path}")
+    return run_dir
+
+
+def load_run(run_dir: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Dict[str, Any]]:
+    """Load a saved run -> ``(metrics_df, returns_df_or_None, meta_dict)``."""
+    metrics = pd.read_csv(os.path.join(run_dir, "metrics.csv"), index_col=0)
+    rpath = os.path.join(run_dir, "returns.parquet")
+    returns = pd.read_parquet(rpath) if os.path.exists(rpath) else None
+    with open(os.path.join(run_dir, "meta.json")) as fh:
+        meta = json.load(fh)
+    return metrics, returns, meta
+
+
+def compare_runs(
+    out_dir: str = "results", metric: str = "sharpe", pivot: bool = True
+) -> pd.DataFrame:
+    """Read the cumulative ``runs_log.csv`` for cross-run comparison.
+
+    With ``pivot=True`` (default) returns a ``strategy x run_id`` table of
+    *metric*; otherwise the raw long-format log (all metrics + config).
+    """
+    log_path = os.path.join(out_dir, "runs_log.csv")
+    if not os.path.exists(log_path):
+        raise FileNotFoundError(f"No runs log at {log_path}; call save_run() first.")
+    log = pd.read_csv(log_path)
+    if not pivot:
+        return log
+    return log.pivot_table(index="strategy", columns="run_id", values=metric)
 
 
 # ---------------------------------------------------------------------------
@@ -892,6 +1296,48 @@ DEFAULT_PARAM_GRIDS: Dict[str, Dict[str, List[Any]]] = {
 # ---------------------------------------------------------------------------
 # 5. Backtesting & walk-forward validation
 # ---------------------------------------------------------------------------
+@dataclass
+class CostModel:
+    """Transaction-cost model: linear spread/slippage + square-root impact.
+
+    Per-asset cost (in return units) for trading ``|dw|`` of the book is::
+
+        cost = |dw| * (spread_bps + impact_coef_bps * sqrt(participation)) / 1e4
+        participation = |dw| * capital / ADV_value
+
+    The linear ``spread_bps`` term is the half-spread + fixed slippage you always
+    pay.  The square-root term is market impact: it grows with how large the
+    trade is relative to the asset's average daily traded value (``adv``), so big
+    trades in thin names are penalised -- the classic Almgren-style impact curve.
+    With ``impact_coef_bps == 0`` (or no ``adv``) it reduces to the old linear
+    model, preserving prior behaviour.
+
+    Parameters
+    ----------
+    spread_bps:        linear cost per unit turnover (bps).
+    impact_coef_bps:   impact cost (bps) at 100% participation of one bar's ADV.
+    capital:           notional capital deployed, in the data's price*volume units.
+    adv:               per-asset average daily traded value; index = ticker.
+    """
+
+    spread_bps: float = 1.0
+    impact_coef_bps: float = 0.0
+    capital: float = 1e7
+    adv: Optional[pd.Series] = None
+
+    def per_asset_cost(self, weight_chg: pd.DataFrame) -> pd.DataFrame:
+        cost = weight_chg * (self.spread_bps / 1e4)
+        if self.impact_coef_bps and self.adv is not None:
+            adv = self.adv.reindex(weight_chg.columns)
+            adv = adv.where(adv > 0)
+            participation = (weight_chg * self.capital).div(adv, axis=1)
+            impact_bps = self.impact_coef_bps * np.sqrt(
+                participation.clip(lower=0).fillna(0.0)
+            )
+            cost = cost + weight_chg * (impact_bps / 1e4)
+        return cost
+
+
 class Backtester:
     """Vectorised, look-ahead-safe backtester.
 
@@ -917,6 +1363,16 @@ class Backtester:
         the weight on the last bar of each session is set to zero, so the
         overnight close->open gap return is never earned and no position is
         carried overnight.  This is the right mode for minute-level strategies.
+    signal_smooth:
+        Turnover control #3.  EMA span (in bars) applied to the target weights
+        so positions move gradually instead of flipping.  ``None`` = off.
+    rebalance_every:
+        Turnover control #2.  Rebalance only every N bars, holding the target
+        in between.  ``1`` (default) = rebalance every bar.
+    no_trade_band:
+        Turnover control #1.  Hysteresis band: only trade a name when its target
+        weight drifts more than this *fraction* from the held weight (e.g.
+        ``0.25`` = trade on a 25% deviation).  ``None`` = off.
     """
 
     def __init__(
@@ -926,12 +1382,49 @@ class Backtester:
         vol_window: int = 20,
         max_leverage: float = 3.0,
         intraday: bool = False,
+        signal_smooth: Optional[int] = None,
+        rebalance_every: int = 1,
+        no_trade_band: Optional[float] = None,
+        cost_model: Optional[CostModel] = None,
+        liquidity_adv: Optional[pd.Series] = None,
+        liquidity_power: float = 0.0,
     ) -> None:
         self.cost_bps = cost_bps
         self.target_vol = target_vol
         self.vol_window = vol_window
         self.max_leverage = max_leverage
         self.intraday = intraday
+        # --- turnover controls (all default to "off" = original behaviour) ---
+        self.signal_smooth = signal_smooth      # #3 EMA span applied to weights
+        self.rebalance_every = rebalance_every  # #2 act every N bars
+        self.no_trade_band = no_trade_band      # #1 rel. deviation band to trade
+        # Full cost model (spread + impact); falls back to linear cost_bps.
+        self.cost_model = cost_model
+        # Liquidity-weighted sizing: tilt positions by ADV**power (0 = off).
+        self.liquidity_adv = liquidity_adv
+        self.liquidity_power = liquidity_power
+
+    def _liquidity_weight(self, weights: pd.DataFrame) -> pd.DataFrame:
+        """Tilt position sizes toward more-liquid names by ``ADV**power``.
+
+        Each name's weight is multiplied by ``ADV_i ** liquidity_power`` and then
+        the long and short legs are each rescaled back to their original per-bar
+        totals -- so gross exposure and dollar-neutrality are preserved while the
+        book leans toward lower-impact names.  ``power == 0`` leaves weights
+        unchanged (equal sizing); larger power tilts harder toward liquidity.
+        """
+        if not self.liquidity_power or self.liquidity_adv is None:
+            return weights
+        adv = self.liquidity_adv.reindex(weights.columns)
+        factor = (adv / adv.median()) ** self.liquidity_power
+        factor = factor.fillna(0.0)               # untradeable names -> drop
+        pos, neg = weights.clip(lower=0), weights.clip(upper=0)
+        wpos, wneg = pos.mul(factor, axis=1), neg.mul(factor, axis=1)
+        # Rescale each leg to its original per-bar exposure (keeps neutrality).
+        spos = pos.sum(axis=1) / wpos.sum(axis=1).replace(0, np.nan)
+        sneg = neg.sum(axis=1) / wneg.sum(axis=1).replace(0, np.nan)
+        out = wpos.mul(spos, axis=0).fillna(0.0) + wneg.mul(sneg, axis=0).fillna(0.0)
+        return out
 
     def _vol_target_weights(
         self, weights: pd.DataFrame, asset_rets: pd.DataFrame
@@ -947,38 +1440,109 @@ class Backtester:
         return weights.mul(leverage, axis=0), leverage
 
     @staticmethod
-    def _flatten_eod(weights: pd.DataFrame) -> pd.DataFrame:
+    def _eod_mask(index: pd.DatetimeIndex) -> np.ndarray:
+        """Boolean mask: True on the last bar of each trading day."""
+        days = pd.Series(index.normalize(), index=index)
+        return (days != days.shift(-1)).to_numpy()
+
+    @classmethod
+    def _flatten_eod(cls, weights: pd.DataFrame) -> pd.DataFrame:
         """Zero the weights on the last bar of each trading day (go flat EOD)."""
-        days = pd.Series(weights.index.normalize(), index=weights.index)
-        is_last_of_day = days != days.shift(-1)   # True on each day's final bar
         w = weights.copy()
-        w.loc[is_last_of_day.values] = 0.0
+        w.loc[cls._eod_mask(weights.index)] = 0.0
         return w
 
-    def run(self, strategy: Strategy, close: pd.DataFrame, name: Optional[str] = None) -> BacktestResult:
+    @staticmethod
+    def _throttle(weights: pd.DataFrame, every: int) -> pd.DataFrame:
+        """#2 Rebalance only every *every* bars; hold target in between."""
+        keep = pd.Series((np.arange(len(weights)) % every) == 0, index=weights.index)
+        return weights.where(keep, axis=0).ffill().fillna(0.0)
+
+    @staticmethod
+    def _apply_no_trade_band(
+        weights: pd.DataFrame, band: float, eod_mask: Optional[np.ndarray] = None
+    ) -> pd.DataFrame:
+        """#1 Hysteresis: only trade a name when its target weight drifts more
+        than *band* (relative) from the currently-held weight; otherwise hold.
+
+        ``eod_mask`` (intraday) forces the book flat on each day's last bar, so
+        the no-overnight guarantee is preserved and the band resets each day.
+        """
+        W = weights.to_numpy(dtype=float)
+        out = np.empty_like(W)
+        held = np.zeros(W.shape[1])
+        for i in range(W.shape[0]):
+            if eod_mask is not None and eod_mask[i]:
+                held = np.zeros_like(held)            # mandatory EOD flatten
+            else:
+                target = W[i]
+                denom = np.maximum.reduce([np.abs(target), np.abs(held),
+                                           np.full_like(target, 1e-9)])
+                trade = np.abs(target - held) > band * denom
+                held = np.where(trade, target, held)
+            out[i] = held
+        return pd.DataFrame(out, index=weights.index, columns=weights.columns)
+
+    def run(
+        self,
+        strategy: Strategy,
+        close: pd.DataFrame,
+        name: Optional[str] = None,
+        with_assets: bool = True,
+    ) -> BacktestResult:
         raw_weights = strategy.generate_weights(close).reindex(close.index)
         asset_rets = close.pct_change(fill_method=None).reindex(close.index)
 
-        leverage = None
         weights = raw_weights
+        # Liquidity-weighted sizing: tilt the book toward lower-impact names.
+        if self.liquidity_power and self.liquidity_adv is not None:
+            weights = self._liquidity_weight(weights)
+        # #3 Signal smoothing: EMA the target weights so positions move gradually.
+        if self.signal_smooth:
+            weights = weights.ewm(span=int(self.signal_smooth)).mean()
+
+        leverage = None
         if self.target_vol is not None:
-            weights, leverage = self._vol_target_weights(raw_weights, asset_rets)
-        if self.intraday:
+            weights, leverage = self._vol_target_weights(weights, asset_rets)
+
+        # #2 Rebalance throttle: only act every N bars.
+        if self.rebalance_every and self.rebalance_every > 1:
+            weights = self._throttle(weights, int(self.rebalance_every))
+
+        # #1 No-trade band (hysteresis) and/or EOD flatten for intraday.
+        eod_mask = self._eod_mask(weights.index) if self.intraday else None
+        if self.no_trade_band:
+            weights = self._apply_no_trade_band(weights, self.no_trade_band, eod_mask)
+        elif self.intraday:
             # Flat into the close -> lagged weight on the next day's first bar is
             # zero, so the overnight gap return is excluded.
             weights = self._flatten_eod(weights)
 
         # Lag weights by one bar: decide on bar t, earn return over t -> t+1.
         lagged = weights.shift(1).fillna(0.0)
-        gross = (lagged * asset_rets).sum(axis=1)
-        # Transaction costs on turnover (includes the EOD flatten / next-open re-entry).
-        turnover = (weights - weights.shift(1)).abs().sum(axis=1).fillna(0.0)
-        net = (gross - turnover * (self.cost_bps / 1e4)).fillna(0.0)
-        # Drop the first bar (no prior weight) and align gross/turnover to net.
+        weight_chg = (weights - weights.shift(1)).abs()
+        # Per-asset gross P&L and per-asset cost; summing over assets gives the
+        # portfolio series, so the decomposition is exact.
+        asset_gross = lagged * asset_rets
+        gross = asset_gross.sum(axis=1)
+        turnover = weight_chg.sum(axis=1).fillna(0.0)
+        gross_exposure = weights.abs().sum(axis=1)        # book size / leverage
+        # Transaction cost: spread + (optional) square-root market impact.
+        cost_model = self.cost_model or CostModel(spread_bps=self.cost_bps)
+        asset_cost = cost_model.per_asset_cost(weight_chg)
+        cost = asset_cost.sum(axis=1)
+        net = (gross - cost).fillna(0.0)
+        # Drop the first bar (no prior weight) and align series to net.
         gross, turnover, net = gross.iloc[1:], turnover.iloc[1:], net.iloc[1:]
+        gross_exposure = gross_exposure.iloc[1:]
+
+        asset_net = None
+        if with_assets:
+            asset_net = (asset_gross - asset_cost).iloc[1:]
 
         meta = {"params": dict(strategy.params), "kind": strategy.kind,
-                "intraday": self.intraday}
+                "intraday": self.intraday, "tcost_bps": cost_model.spread_bps,
+                "impact_coef_bps": cost_model.impact_coef_bps}
         if leverage is not None:
             meta["target_vol"] = self.target_vol
             meta["avg_leverage"] = float(leverage.replace(0.0, np.nan).mean())
@@ -990,6 +1554,8 @@ class Backtester:
             meta=meta,
             gross_returns=gross,
             turnover=turnover,
+            asset_returns=asset_net,
+            gross_exposure=gross_exposure,
         )
         return res
 
@@ -1014,6 +1580,10 @@ class WalkForwardValidator:
         ``"anchored"`` (expanding IS) or ``"rolling"`` (fixed-length IS).
     scoring:
         Metric maximised during optimisation (default ``"sharpe"``).
+    turnover_penalty:
+        Turnover control #6.  Subtract ``turnover_penalty * turnover_per_bar``
+        from each candidate's in-sample score, so parameter selection prefers
+        lower-churn (more implementable) configurations.  ``0`` = off.
     """
 
     def __init__(
@@ -1027,17 +1597,31 @@ class WalkForwardValidator:
         vol_window: int = 20,
         max_leverage: float = 3.0,
         intraday: bool = False,
+        signal_smooth: Optional[int] = None,
+        rebalance_every: int = 1,
+        no_trade_band: Optional[float] = None,
+        turnover_penalty: float = 0.0,
+        cost_model: Optional[CostModel] = None,
+        liquidity_adv: Optional[pd.Series] = None,
+        liquidity_power: float = 0.0,
     ) -> None:
         self.n_splits = n_splits
         self.train_span = train_span
         self.mode = mode
         self.scoring = scoring
+        self.turnover_penalty = turnover_penalty
         self.backtester = Backtester(
             cost_bps=cost_bps,
             target_vol=target_vol,
             vol_window=vol_window,
             max_leverage=max_leverage,
             intraday=intraday,
+            signal_smooth=signal_smooth,
+            rebalance_every=rebalance_every,
+            no_trade_band=no_trade_band,
+            cost_model=cost_model,
+            liquidity_adv=liquidity_adv,
+            liquidity_power=liquidity_power,
         )
 
     @staticmethod
@@ -1067,6 +1651,8 @@ class WalkForwardValidator:
         oos_returns: List[pd.Series] = []
         oos_gross: List[pd.Series] = []
         oos_turnover: List[pd.Series] = []
+        oos_exposure: List[pd.Series] = []
+        oos_assets: List[pd.DataFrame] = []
         chosen: List[Dict[str, Any]] = []
 
         for i in range(self.n_splits):
@@ -1083,8 +1669,12 @@ class WalkForwardValidator:
             best_score, best_params = -np.inf, combos[0]
             for params in combos:
                 strat = strategy_cls(**params)
-                is_res = self.backtester.run(strat, is_slice)
+                # Per-asset breakdown not needed while scoring candidates.
+                is_res = self.backtester.run(strat, is_slice, with_assets=False)
                 score = is_res.metrics.get(self.scoring, np.nan)
+                # #6 Penalise turnover so selection favours implementable params.
+                if self.turnover_penalty and is_res.turnover is not None:
+                    score = score - self.turnover_penalty * float(is_res.turnover.mean())
                 if np.isfinite(score) and score > best_score:
                     best_score, best_params = score, params
 
@@ -1096,6 +1686,10 @@ class WalkForwardValidator:
             if oos_res.gross_returns is not None:
                 oos_gross.append(oos_res.gross_returns.loc[oos_res.gross_returns.index >= cutoff])
                 oos_turnover.append(oos_res.turnover.loc[oos_res.turnover.index >= cutoff])
+            if oos_res.gross_exposure is not None:
+                oos_exposure.append(oos_res.gross_exposure.loc[oos_res.gross_exposure.index >= cutoff])
+            if oos_res.asset_returns is not None:
+                oos_assets.append(oos_res.asset_returns.loc[oos_res.asset_returns.index >= cutoff])
             chosen.append(best_params)
 
         def _stitch(parts: List[pd.Series]) -> Optional[pd.Series]:
@@ -1103,6 +1697,12 @@ class WalkForwardValidator:
                 return None
             s = pd.concat(parts).sort_index()
             return s[~s.index.duplicated(keep="first")]
+
+        def _stitch_df(parts: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
+            if not parts:
+                return None
+            df = pd.concat(parts).sort_index()
+            return df[~df.index.duplicated(keep="first")]
 
         stitched = _stitch(oos_returns)
         if stitched is None or stitched.empty:
@@ -1120,9 +1720,16 @@ class WalkForwardValidator:
                 "chosen_params": chosen,
                 "kind": strategy_cls.kind,
                 "intraday": self.backtester.intraday,
+                "tcost_bps": (self.backtester.cost_model.spread_bps
+                              if self.backtester.cost_model
+                              else self.backtester.cost_bps),
+                "impact_coef_bps": (self.backtester.cost_model.impact_coef_bps
+                                    if self.backtester.cost_model else 0.0),
             },
             gross_returns=_stitch(oos_gross),
             turnover=_stitch(oos_turnover),
+            asset_returns=_stitch_df(oos_assets),
+            gross_exposure=_stitch(oos_exposure),
         )
 
 
@@ -1147,20 +1754,40 @@ class QuantLab:
         vol_window: int = 20,
         max_leverage: float = 3.0,
         intraday: bool = False,
+        cache_dir: Optional[str] = None,
+        signal_smooth: Optional[int] = None,
+        rebalance_every: int = 1,
+        no_trade_band: Optional[float] = None,
+        turnover_penalty: float = 0.0,
+        impact_coef_bps: float = 0.0,
+        capital: float = 1e7,
+        liquidity_power: float = 0.0,
     ) -> None:
-        self.market = MarketData(data_dir)
+        self.market = MarketData(data_dir, cache_dir=cache_dir)
         self.classifier = TickerClassifier
         self.cost_bps = cost_bps
         self.target_vol = target_vol
         self.vol_window = vol_window
         self.max_leverage = max_leverage
         self.intraday = intraday
+        # Turnover controls (#1 band, #2 throttle, #3 smoothing, #6 penalty).
+        self.signal_smooth = signal_smooth
+        self.rebalance_every = rebalance_every
+        self.no_trade_band = no_trade_band
+        self.turnover_penalty = turnover_penalty
+        # Square-root market-impact model (off when impact_coef_bps == 0).
+        self.impact_coef_bps = impact_coef_bps
+        self.capital = capital
+        # Liquidity-weighted sizing exponent (0 = equal sizing).
+        self.liquidity_power = liquidity_power
+        self.contract = "F1"
+        self.frequency = "daily"
         self.backtester = Backtester(
             cost_bps=cost_bps, target_vol=target_vol,
             vol_window=vol_window, max_leverage=max_leverage, intraday=intraday,
+            signal_smooth=signal_smooth, rebalance_every=rebalance_every,
+            no_trade_band=no_trade_band,
         )
-        self.contract = "F1"
-        self.frequency = "daily"
 
     # -- data --------------------------------------------------------------
     def load(
@@ -1171,47 +1798,206 @@ class QuantLab:
         features: Optional[Sequence[str]] = None,
         start: Optional[str] = None,
         end: Optional[str] = None,
+        use_cache: bool = True,
+        rebuild_cache: bool = False,
     ) -> Dict[str, pd.DataFrame]:
         self.contract, self.frequency = contract, frequency
-        return self.market.load(tickers, contract, frequency, features, start, end)
+        return self.market.load(
+            tickers, contract, frequency, features, start, end,
+            use_cache=use_cache, rebuild_cache=rebuild_cache,
+        )
 
-    def _close_panel(self, kind: str) -> pd.DataFrame:
+    #: Suffix appended to a result name to flag which universe it ran on.
+    _UNIVERSE_SUFFIX = {"index": "index", "equity": "ss"}  # ss = single-stock
+
+    def _universe_panel(self, universe: str) -> pd.DataFrame:
         close = self.market.panel("Close")
         idx_cols, eq_cols = self.classifier.split(close.columns)
-        sub = close[idx_cols] if kind == "timeseries" else close[eq_cols]
-        return sub.dropna(how="all")
+        cols = idx_cols if universe == "index" else eq_cols
+        return close[cols].dropna(how="all")
+
+    def _adv_value(self, cols: Sequence[str]) -> pd.Series:
+        """Average daily traded value per ticker (price*volume), for impact."""
+        advs = {}
+        for t in cols:
+            df = self.market.data.get(t)
+            if df is None or "Volume" not in df or "Close" not in df:
+                continue
+            value = (df["Volume"] * df["Close"]).dropna()
+            if value.empty:
+                continue
+            daily = value.groupby(value.index.normalize()).sum()
+            advs[t] = float(daily.mean())
+        return pd.Series(advs, dtype=float)
+
+    def _cost_model(self, cols: Sequence[str], adv: Optional[pd.Series] = None) -> Optional[CostModel]:
+        """Build the CostModel for a universe (None -> linear cost only)."""
+        if not self.impact_coef_bps:
+            return None
+        return CostModel(
+            spread_bps=self.cost_bps,
+            impact_coef_bps=self.impact_coef_bps,
+            capital=self.capital,
+            adv=self._adv_value(cols) if adv is None else adv,
+        )
+
+    def liquid_equities(self, n: int) -> List[str]:
+        """Top *n* equity tickers by average daily traded value (most liquid).
+
+        Requires data to be loaded; ranks on ADV (price*volume) of the loaded
+        bars.  Useful to restrict a cross-sectional strategy to names where
+        market impact is lowest.
+        """
+        _, eq = self.classifier.split(list(self.market.data))
+        adv = self._adv_value(eq).dropna().sort_values(ascending=False)
+        return adv.head(n).index.tolist()
 
     # -- single strategy ---------------------------------------------------
-    def run_strategy(self, name: str, walk_forward: bool = True, **params: Any) -> BacktestResult:
+    def run_strategy(
+        self,
+        name: str,
+        walk_forward: bool = True,
+        universe: Optional[str] = None,
+        tickers: Optional[Sequence[str]] = None,
+        **params: Any,
+    ) -> BacktestResult:
+        """Run one strategy.
+
+        ``universe`` selects the asset set: ``"index"`` (the 4 index futures) or
+        ``"equity"`` (single-name stocks).  Cross-sectional strategies are always
+        run on equities.  Time-series strategies default to indices but can be
+        pointed at the single-name universe -- in which case each stock is traded
+        independently on its own signal and the result is suffixed ``_ss`` (vs
+        ``_index``), e.g. ``ts_momentum_ss``.
+
+        ``tickers`` optionally restricts the universe to a subset (e.g. the most
+        liquid names from :meth:`liquid_equities`).
+        """
         if name not in STRATEGIES:
             raise KeyError(f"Unknown strategy {name!r}; choose from {list(STRATEGIES)}")
         cls = STRATEGIES[name]
-        close = self._close_panel(cls.kind)
+        if cls.kind == "crosssectional":
+            universe = "equity"
+        else:
+            universe = universe or "index"
+        close = self._universe_panel(universe)
+        if tickers is not None:
+            keep = [c for c in close.columns if c in set(tickers)]
+            close = close[keep]
+
+        result_name = name
+        if cls.kind == "timeseries":
+            result_name = f"{name}_{self._UNIVERSE_SUFFIX[universe]}"
+
+        # Compute ADV once; reused by both the impact model and liquidity sizing.
+        adv = (self._adv_value(close.columns)
+               if (self.impact_coef_bps or self.liquidity_power) else None)
+        cost_model = self._cost_model(close.columns, adv=adv)
+        liq_adv = adv if self.liquidity_power else None
+
         if walk_forward:
             grid = {k: [v] for k, v in params.items()} if params else None
             validator = WalkForwardValidator(
                 cost_bps=self.cost_bps, target_vol=self.target_vol,
                 vol_window=self.vol_window, max_leverage=self.max_leverage,
-                intraday=self.intraday,
+                intraday=self.intraday, signal_smooth=self.signal_smooth,
+                rebalance_every=self.rebalance_every,
+                no_trade_band=self.no_trade_band,
+                turnover_penalty=self.turnover_penalty,
+                cost_model=cost_model,
+                liquidity_adv=liq_adv, liquidity_power=self.liquidity_power,
             )
-            return validator.run(cls, close, grid, name=name)
-        return self.backtester.run(cls(**params), close, name=name)
+            return validator.run(cls, close, grid, name=result_name)
+        bt = Backtester(
+            cost_bps=self.cost_bps, target_vol=self.target_vol,
+            vol_window=self.vol_window, max_leverage=self.max_leverage,
+            intraday=self.intraday, signal_smooth=self.signal_smooth,
+            rebalance_every=self.rebalance_every, no_trade_band=self.no_trade_band,
+            cost_model=cost_model,
+            liquidity_adv=liq_adv, liquidity_power=self.liquidity_power,
+        )
+        return bt.run(cls(**params), close, name=result_name)
 
-    def run_timeseries(self, name: str = "ts_momentum", **kw: Any) -> BacktestResult:
-        return self.run_strategy(name, **kw)
+    def run_timeseries(self, name: str = "ts_momentum", universe: str = "index", **kw: Any) -> BacktestResult:
+        return self.run_strategy(name, universe=universe, **kw)
 
     def run_crosssectional(self, name: str = "xs_momentum", **kw: Any) -> BacktestResult:
         return self.run_strategy(name, **kw)
 
+    def capacity_frontier(
+        self,
+        name: str = "xs_mean_reversion",
+        capitals: Optional[Sequence[float]] = None,
+        **run_kwargs: Any,
+    ) -> pd.DataFrame:
+        """Sweep book size and find the capacity (Sharpe=0 book-size frontier).
+
+        Re-runs *name* across a ladder of ``capital`` levels (needs
+        ``impact_coef_bps > 0`` to be meaningful) and returns a table of
+        impact-aware Sharpe / realized cost / turnover per book size.  The
+        log-interpolated Sharpe=0 crossing -- the strategy's capacity -- is
+        stored on ``df.attrs['frontier_capital']``.
+        """
+        capitals = list(capitals) if capitals is not None else \
+            [1e7, 3e7, 5e7, 1e8, 2e8, 3e8, 5e8, 1e9]
+        saved = self.capital
+        rows = []
+        try:
+            for c in capitals:
+                self.capital = c
+                r = self.run_strategy(name, **run_kwargs)
+                es = execution_stats(r)
+                rows.append({
+                    "capital": c,
+                    "sharpe": r.metrics.get("sharpe", np.nan),
+                    "realized_cost_bps": es["realized_cost_bps"],
+                    "ann_turnover": es["ann_turnover"],
+                })
+        finally:
+            self.capital = saved
+        df = pd.DataFrame(rows)
+        # Log-linear interpolation of the first positive->negative Sharpe crossing.
+        frontier = np.nan
+        x, y = np.log10(df["capital"].to_numpy()), df["sharpe"].to_numpy()
+        for i in range(len(y) - 1):
+            if y[i] >= 0 >= y[i + 1] and y[i] != y[i + 1]:
+                frontier = 10 ** (x[i] + (0 - y[i]) * (x[i + 1] - x[i]) / (y[i + 1] - y[i]))
+                break
+        df.attrs["frontier_capital"] = frontier
+        return df
+
     # -- batches -----------------------------------------------------------
-    def run_all(self, walk_forward: bool = True) -> List[BacktestResult]:
-        """Run every registered strategy on its appropriate universe."""
+    #: (strategy, universe) combos skipped by run_all by default.  The Hurst
+    #: regime model on every single name is very slow and not worth it, so
+    #: ts_regime_adaptive on equities (``ts_regime_adaptive_ss``) is off by
+    #: default; pass ``skip=set()`` to run everything.
+    DEFAULT_SKIP = frozenset({("ts_regime_adaptive", "equity")})
+
+    def run_all(
+        self,
+        walk_forward: bool = True,
+        skip: Optional[Iterable[Tuple[str, str]]] = None,
+    ) -> List[BacktestResult]:
+        """Run every strategy on its relevant universe(s).
+
+        Time-series strategies are run on *both* the index and single-name
+        universes (``*_index`` / ``*_ss``); cross-sectional strategies on the
+        single-name universe.  *skip* is a set of ``(strategy_name, universe)``
+        pairs to omit; it defaults to :data:`DEFAULT_SKIP`.
+        """
+        skip = self.DEFAULT_SKIP if skip is None else set(skip)
         results = []
-        for name in STRATEGIES:
-            try:
-                results.append(self.run_strategy(name, walk_forward=walk_forward))
-            except Exception as exc:                       # keep the batch going
-                print(f"[QuantLab] {name} failed: {exc}")
+        for name, cls in STRATEGIES.items():
+            universes = ("index", "equity") if cls.kind == "timeseries" else ("equity",)
+            for uni in universes:
+                if (name, uni) in skip:
+                    continue
+                try:
+                    results.append(
+                        self.run_strategy(name, walk_forward=walk_forward, universe=uni)
+                    )
+                except Exception as exc:                   # keep the batch going
+                    print(f"[QuantLab] {name} ({uni}) failed: {exc}")
         return results
 
     @staticmethod
@@ -1222,6 +2008,44 @@ class QuantLab:
     def plot(results: Sequence[BacktestResult], **kwargs: Any):
         """Render the 2x3 performance dashboard (see :func:`plot_dashboard`)."""
         return plot_dashboard(results, **kwargs)
+
+    def save(
+        self,
+        results: Sequence[BacktestResult],
+        run_name: Optional[str] = None,
+        out_dir: str = "results",
+        latest_label: Optional[str] = None,
+    ) -> str:
+        """Persist *results* with this lab's run config auto-captured.
+
+        Writes a timestamped run folder, refreshes a ``latest/<label>`` snapshot
+        and appends to ``results/runs_log.csv`` so runs can be compared over time
+        (see :func:`save_run`, :func:`compare_runs`).  ``latest_label`` defaults
+        to ``"intraday"``/``"daily"`` so those snapshots are kept side by side.
+        """
+        config = {
+            "frequency": self.frequency,
+            "contract": self.contract,
+            "cost_bps": self.cost_bps,
+            "target_vol": self.target_vol,
+            "intraday": self.intraday,
+            "vol_window": self.vol_window,
+            "max_leverage": self.max_leverage,
+            "n_assets": len(self.market.data),
+            "signal_smooth": self.signal_smooth,
+            "rebalance_every": self.rebalance_every,
+            "no_trade_band": self.no_trade_band,
+            "turnover_penalty": self.turnover_penalty,
+            "impact_coef_bps": self.impact_coef_bps,
+            "capital": self.capital,
+            "liquidity_power": self.liquidity_power,
+        }
+        if latest_label is None:
+            latest_label = "intraday" if self.intraday else "daily"
+        return save_run(
+            results, out_dir=out_dir, run_name=run_name,
+            config=config, latest_label=latest_label,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - quick smoke run
