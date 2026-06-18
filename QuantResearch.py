@@ -1871,6 +1871,48 @@ class QuantLab:
     def run_crosssectional(self, name: str = "xs_momentum", **kw: Any) -> BacktestResult:
         return self.run_strategy(name, **kw)
 
+    def capacity_frontier(
+        self,
+        name: str = "xs_mean_reversion",
+        capitals: Optional[Sequence[float]] = None,
+        **run_kwargs: Any,
+    ) -> pd.DataFrame:
+        """Sweep book size and find the capacity (Sharpe=0 book-size frontier).
+
+        Re-runs *name* across a ladder of ``capital`` levels (needs
+        ``impact_coef_bps > 0`` to be meaningful) and returns a table of
+        impact-aware Sharpe / realized cost / turnover per book size.  The
+        log-interpolated Sharpe=0 crossing -- the strategy's capacity -- is
+        stored on ``df.attrs['frontier_capital']``.
+        """
+        capitals = list(capitals) if capitals is not None else \
+            [1e7, 3e7, 5e7, 1e8, 2e8, 3e8, 5e8, 1e9]
+        saved = self.capital
+        rows = []
+        try:
+            for c in capitals:
+                self.capital = c
+                r = self.run_strategy(name, **run_kwargs)
+                es = execution_stats(r)
+                rows.append({
+                    "capital": c,
+                    "sharpe": r.metrics.get("sharpe", np.nan),
+                    "realized_cost_bps": es["realized_cost_bps"],
+                    "ann_turnover": es["ann_turnover"],
+                })
+        finally:
+            self.capital = saved
+        df = pd.DataFrame(rows)
+        # Log-linear interpolation of the first positive->negative Sharpe crossing.
+        frontier = np.nan
+        x, y = np.log10(df["capital"].to_numpy()), df["sharpe"].to_numpy()
+        for i in range(len(y) - 1):
+            if y[i] >= 0 >= y[i + 1] and y[i] != y[i + 1]:
+                frontier = 10 ** (x[i] + (0 - y[i]) * (x[i + 1] - x[i]) / (y[i + 1] - y[i]))
+                break
+        df.attrs["frontier_capital"] = frontier
+        return df
+
     # -- batches -----------------------------------------------------------
     #: (strategy, universe) combos skipped by run_all by default.  The Hurst
     #: regime model on every single name is very slow and not worth it, so
