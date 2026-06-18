@@ -838,7 +838,7 @@ _RUN_CONFIG_KEYS = [
     "frequency", "contract", "cost_bps", "target_vol", "intraday",
     "vol_window", "max_leverage", "n_assets",
     "signal_smooth", "rebalance_every", "no_trade_band", "turnover_penalty",
-    "impact_coef_bps", "capital",
+    "impact_coef_bps", "capital", "liquidity_power",
 ]
 
 
@@ -1338,6 +1338,8 @@ class Backtester:
         rebalance_every: int = 1,
         no_trade_band: Optional[float] = None,
         cost_model: Optional[CostModel] = None,
+        liquidity_adv: Optional[pd.Series] = None,
+        liquidity_power: float = 0.0,
     ) -> None:
         self.cost_bps = cost_bps
         self.target_vol = target_vol
@@ -1350,6 +1352,31 @@ class Backtester:
         self.no_trade_band = no_trade_band      # #1 rel. deviation band to trade
         # Full cost model (spread + impact); falls back to linear cost_bps.
         self.cost_model = cost_model
+        # Liquidity-weighted sizing: tilt positions by ADV**power (0 = off).
+        self.liquidity_adv = liquidity_adv
+        self.liquidity_power = liquidity_power
+
+    def _liquidity_weight(self, weights: pd.DataFrame) -> pd.DataFrame:
+        """Tilt position sizes toward more-liquid names by ``ADV**power``.
+
+        Each name's weight is multiplied by ``ADV_i ** liquidity_power`` and then
+        the long and short legs are each rescaled back to their original per-bar
+        totals -- so gross exposure and dollar-neutrality are preserved while the
+        book leans toward lower-impact names.  ``power == 0`` leaves weights
+        unchanged (equal sizing); larger power tilts harder toward liquidity.
+        """
+        if not self.liquidity_power or self.liquidity_adv is None:
+            return weights
+        adv = self.liquidity_adv.reindex(weights.columns)
+        factor = (adv / adv.median()) ** self.liquidity_power
+        factor = factor.fillna(0.0)               # untradeable names -> drop
+        pos, neg = weights.clip(lower=0), weights.clip(upper=0)
+        wpos, wneg = pos.mul(factor, axis=1), neg.mul(factor, axis=1)
+        # Rescale each leg to its original per-bar exposure (keeps neutrality).
+        spos = pos.sum(axis=1) / wpos.sum(axis=1).replace(0, np.nan)
+        sneg = neg.sum(axis=1) / wneg.sum(axis=1).replace(0, np.nan)
+        out = wpos.mul(spos, axis=0).fillna(0.0) + wneg.mul(sneg, axis=0).fillna(0.0)
+        return out
 
     def _vol_target_weights(
         self, weights: pd.DataFrame, asset_rets: pd.DataFrame
@@ -1419,6 +1446,9 @@ class Backtester:
         asset_rets = close.pct_change().reindex(close.index)
 
         weights = raw_weights
+        # Liquidity-weighted sizing: tilt the book toward lower-impact names.
+        if self.liquidity_power and self.liquidity_adv is not None:
+            weights = self._liquidity_weight(weights)
         # #3 Signal smoothing: EMA the target weights so positions move gradually.
         if self.signal_smooth:
             weights = weights.ewm(span=int(self.signal_smooth)).mean()
@@ -1524,6 +1554,8 @@ class WalkForwardValidator:
         no_trade_band: Optional[float] = None,
         turnover_penalty: float = 0.0,
         cost_model: Optional[CostModel] = None,
+        liquidity_adv: Optional[pd.Series] = None,
+        liquidity_power: float = 0.0,
     ) -> None:
         self.n_splits = n_splits
         self.train_span = train_span
@@ -1540,6 +1572,8 @@ class WalkForwardValidator:
             rebalance_every=rebalance_every,
             no_trade_band=no_trade_band,
             cost_model=cost_model,
+            liquidity_adv=liquidity_adv,
+            liquidity_power=liquidity_power,
         )
 
     @staticmethod
@@ -1674,6 +1708,7 @@ class QuantLab:
         turnover_penalty: float = 0.0,
         impact_coef_bps: float = 0.0,
         capital: float = 1e7,
+        liquidity_power: float = 0.0,
     ) -> None:
         self.market = MarketData(data_dir, cache_dir=cache_dir)
         self.classifier = TickerClassifier
@@ -1690,6 +1725,8 @@ class QuantLab:
         # Square-root market-impact model (off when impact_coef_bps == 0).
         self.impact_coef_bps = impact_coef_bps
         self.capital = capital
+        # Liquidity-weighted sizing exponent (0 = equal sizing).
+        self.liquidity_power = liquidity_power
         self.contract = "F1"
         self.frequency = "daily"
         self.backtester = Backtester(
@@ -1740,7 +1777,7 @@ class QuantLab:
             advs[t] = float(daily.mean())
         return pd.Series(advs, dtype=float)
 
-    def _cost_model(self, cols: Sequence[str]) -> Optional[CostModel]:
+    def _cost_model(self, cols: Sequence[str], adv: Optional[pd.Series] = None) -> Optional[CostModel]:
         """Build the CostModel for a universe (None -> linear cost only)."""
         if not self.impact_coef_bps:
             return None
@@ -1748,7 +1785,7 @@ class QuantLab:
             spread_bps=self.cost_bps,
             impact_coef_bps=self.impact_coef_bps,
             capital=self.capital,
-            adv=self._adv_value(cols),
+            adv=self._adv_value(cols) if adv is None else adv,
         )
 
     def liquid_equities(self, n: int) -> List[str]:
@@ -1799,7 +1836,11 @@ class QuantLab:
         if cls.kind == "timeseries":
             result_name = f"{name}_{self._UNIVERSE_SUFFIX[universe]}"
 
-        cost_model = self._cost_model(close.columns)
+        # Compute ADV once; reused by both the impact model and liquidity sizing.
+        adv = (self._adv_value(close.columns)
+               if (self.impact_coef_bps or self.liquidity_power) else None)
+        cost_model = self._cost_model(close.columns, adv=adv)
+        liq_adv = adv if self.liquidity_power else None
 
         if walk_forward:
             grid = {k: [v] for k, v in params.items()} if params else None
@@ -1811,6 +1852,7 @@ class QuantLab:
                 no_trade_band=self.no_trade_band,
                 turnover_penalty=self.turnover_penalty,
                 cost_model=cost_model,
+                liquidity_adv=liq_adv, liquidity_power=self.liquidity_power,
             )
             return validator.run(cls, close, grid, name=result_name)
         bt = Backtester(
@@ -1819,6 +1861,7 @@ class QuantLab:
             intraday=self.intraday, signal_smooth=self.signal_smooth,
             rebalance_every=self.rebalance_every, no_trade_band=self.no_trade_band,
             cost_model=cost_model,
+            liquidity_adv=liq_adv, liquidity_power=self.liquidity_power,
         )
         return bt.run(cls(**params), close, name=result_name)
 
@@ -1900,6 +1943,7 @@ class QuantLab:
             "turnover_penalty": self.turnover_penalty,
             "impact_coef_bps": self.impact_coef_bps,
             "capital": self.capital,
+            "liquidity_power": self.liquidity_power,
         }
         if latest_label is None:
             latest_label = "intraday" if self.intraday else "daily"
